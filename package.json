@@ -1,0 +1,16 @@
+{
+  "name": "dp-files",
+  "version": "1.0.0",
+  "description": "Lab container provisioning service",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.1.0",
+    "dockerode": "^4.0.0",
+    "fastify": "^5.0.0",
+    "pino-pretty": "^13.0.0"
+  }
+}
