@@ -10,6 +10,7 @@ const {
   isUuidConflict
 } = require('./container-manager')
 const { isValidUuid } = require('./validate')
+const { verifyIntegrityToken, signLabsJwt, verifyLabsJwt } = require('./auth')
 
 const app = Fastify({
   logger: {
@@ -21,6 +22,83 @@ const app = Fastify({
 })
 
 app.register(cors, { origin: true })
+
+// ─────────────────────────────────────────────
+// JWT bearer guard on all /labs/* routes
+// ─────────────────────────────────────────────
+app.addHook('onRequest', async (request, reply) => {
+  if (!request.url.startsWith('/labs/') && request.url !== '/labs/stats') return
+
+  const authHeader = request.headers.authorization
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return reply.code(401).send({ success: false, error: 'Missing Bearer token' })
+  }
+
+  try {
+    request.jwtPayload = verifyLabsJwt(authHeader.slice(7))
+  } catch {
+    return reply.code(401).send({ success: false, error: 'Invalid or expired token' })
+  }
+})
+
+// ─────────────────────────────────────────────
+// POST /api/auth/integrity-token
+// Body: { integrityToken: string, packageName: string }
+// Returns: { token: string } (JWT, 1hr)
+// ─────────────────────────────────────────────
+app.post('/api/auth/integrity-token', async (request, reply) => {
+  app.log.info({ body: request.body }, 'integrity-token raw body')
+
+  // Accept camelCase or snake_case — app may send either
+  const integrityToken = request.body?.integrityToken ?? request.body?.integrity_token ?? request.body?.token
+  const packageName = request.body?.packageName ?? request.body?.package_name
+
+  if (!integrityToken || !packageName) {
+    return reply.code(400).send({
+      success: false,
+      error: 'Missing required fields. Expected: integrityToken (or integrity_token), packageName (or package_name)',
+      received: Object.keys(request.body || {})
+    })
+  }
+
+  try {
+    const verdict = await verifyIntegrityToken(integrityToken, packageName)
+
+    app.log.info({ verdict: verdict?.tokenPayloadExternal }, 'play integrity verdict')
+
+    const appRecognition = verdict?.tokenPayloadExternal?.appIntegrity?.appRecognitionVerdict
+    const deviceRecognition = verdict?.tokenPayloadExternal?.deviceIntegrity?.deviceRecognitionVerdict ?? []
+
+    // Accept PLAY_RECOGNIZED or UNRECOGNIZED_VERSION (valid cert, newer build not yet in Play Console)
+    const appOk = appRecognition === 'PLAY_RECOGNIZED' || appRecognition === 'UNRECOGNIZED_VERSION'
+    if (!appOk) {
+      return reply.code(403).send({
+        success: false,
+        error: 'App failed integrity check',
+        verdict: appRecognition
+      })
+    }
+
+    // Accept any passing tier: MEETS_BASIC_INTEGRITY, MEETS_DEVICE_INTEGRITY, MEETS_STRONG_INTEGRITY
+    const deviceOk = deviceRecognition.some(v =>
+      v === 'MEETS_BASIC_INTEGRITY' || v === 'MEETS_DEVICE_INTEGRITY' || v === 'MEETS_STRONG_INTEGRITY'
+    )
+    if (!deviceOk) {
+      return reply.code(403).send({
+        success: false,
+        error: 'Device does not meet integrity requirements',
+        verdict: deviceRecognition
+      })
+    }
+
+    const token = signLabsJwt({ packageName, appRecognition })
+
+    return { success: true, token, expiresIn: 3600 }
+  } catch (err) {
+    app.log.error(err)
+    return reply.code(500).send({ success: false, error: err.message })
+  }
+})
 
 // ─────────────────────────────────────────────
 // POST /labs/provision

@@ -11,6 +11,8 @@
     "@fastify/cors": "^10.1.0",
     "dockerode": "^4.0.0",
     "fastify": "^5.0.0",
+    "google-auth-library": "^10.6.2",
+    "jsonwebtoken": "^9.0.3",
     "pino-pretty": "^13.0.0"
   }
 }
