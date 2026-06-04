@@ -207,6 +207,66 @@ function getStats() {
   }
 }
 
+async function getDetailedStats() {
+  const now = Date.now()
+  const containers = []
+
+  for (const [uuid, session] of sessions) {
+    try {
+      const container = docker.getContainer(session.containerId)
+      const stats = await container.stats({ stream: false })
+
+      // CPU %
+      const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage
+      const sysDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage
+      const numCpus = stats.cpu_stats.online_cpus || 1
+      const cpuPercent = sysDelta > 0 ? (cpuDelta / sysDelta) * numCpus * 100 : 0
+
+      // RAM
+      const memUsage = stats.memory_stats.usage || 0
+      const memLimit = stats.memory_stats.limit || CONTAINER_MEMORY_LIMIT
+
+      containers.push({
+        uuid,
+        containerId: session.containerId.slice(0, 12),
+        sshPort: session.sshPort,
+        createdAt: session.createdAt,
+        expiresAt: session.expiresAt,
+        timeRemainingSeconds: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
+        cpuPercent: parseFloat(cpuPercent.toFixed(2)),
+        memUsageMB: parseFloat((memUsage / MB).toFixed(1)),
+        memLimitMB: parseFloat((memLimit / MB).toFixed(1)),
+        memPercent: parseFloat(((memUsage / memLimit) * 100).toFixed(1))
+      })
+    } catch {
+      containers.push({
+        uuid,
+        containerId: session.containerId.slice(0, 12),
+        sshPort: session.sshPort,
+        createdAt: session.createdAt,
+        expiresAt: session.expiresAt,
+        timeRemainingSeconds: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
+        cpuPercent: null,
+        memUsageMB: null,
+        memLimitMB: null,
+        memPercent: null
+      })
+    }
+  }
+
+  const totalMemMB = containers.reduce((s, c) => s + (c.memUsageMB || 0), 0)
+  const totalCpu = containers.reduce((s, c) => s + (c.cpuPercent || 0), 0)
+
+  return {
+    activeSessions: sessions.size,
+    maxConcurrent: MAX_CONCURRENT,
+    availableSlots: MAX_CONCURRENT - sessions.size,
+    totalMemUsageMB: parseFloat(totalMemMB.toFixed(1)),
+    totalCpuPercent: parseFloat(totalCpu.toFixed(2)),
+    containers
+  }
+}
+
 function isUuidConflict(uuid) {
   return sessions.has(uuid)
 }
@@ -216,5 +276,6 @@ module.exports = {
   destroyContainer,
   getConnectionDetails,
   getStats,
+  getDetailedStats,
   isUuidConflict
 }

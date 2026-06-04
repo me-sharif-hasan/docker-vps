@@ -7,6 +7,7 @@ const {
   destroyContainer,
   getConnectionDetails,
   getStats,
+  getDetailedStats,
   isUuidConflict
 } = require('./container-manager')
 const { isValidUuid } = require('./validate')
@@ -273,6 +274,161 @@ app.get('/labs/stats', async () => {
 app.get('/health', async () => {
   return { status: 'ok', timestamp: new Date().toISOString() }
 })
+
+// ─────────────────────────────────────────────
+// Admin — ADMIN_KEY guard (query ?key= or header x-admin-key)
+// GET /api/admin/stats  — JSON
+// GET /dashboard        — HTML UI
+// ─────────────────────────────────────────────
+function checkAdminKey (request, reply) {
+  const adminKey = process.env.ADMIN_KEY
+  if (!adminKey) return // no key set → open (dev mode)
+  const provided = request.headers['x-admin-key'] || request.query.key
+  if (provided !== adminKey) {
+    reply.code(401).send({ success: false, error: 'Unauthorized' })
+    return false
+  }
+}
+
+app.get('/api/admin/stats', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const stats = await getDetailedStats()
+  return { success: true, data: stats }
+})
+
+app.get('/dashboard', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const adminKey = process.env.ADMIN_KEY ? `?key=${process.env.ADMIN_KEY}` : ''
+  reply.type('text/html').send(getDashboardHtml(adminKey))
+})
+
+function getDashboardHtml (qs) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ServerKit Labs — Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:24px}
+  h1{font-size:1.4rem;font-weight:600;margin-bottom:24px;color:#fff}
+  h1 span{color:#6366f1;font-size:0.9rem;margin-left:10px;font-weight:400}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:28px}
+  .card{background:#1e2130;border:1px solid #2d3148;border-radius:12px;padding:20px}
+  .card-label{font-size:0.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+  .card-value{font-size:2rem;font-weight:700;color:#fff}
+  .card-value.green{color:#22c55e}
+  .card-value.yellow{color:#f59e0b}
+  .card-value.red{color:#ef4444}
+  .card-sub{font-size:0.75rem;color:#64748b;margin-top:4px}
+  table{width:100%;border-collapse:collapse;background:#1e2130;border-radius:12px;overflow:hidden;border:1px solid #2d3148}
+  th{text-align:left;padding:12px 16px;font-size:0.72rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #2d3148}
+  td{padding:12px 16px;font-size:0.85rem;border-bottom:1px solid #1a1d2e;font-family:monospace}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#252840}
+  .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:600}
+  .badge.running{background:#14532d;color:#4ade80}
+  .bar-wrap{background:#2d3148;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle;margin-left:6px}
+  .bar{height:6px;border-radius:4px;background:#6366f1}
+  .bar.warn{background:#f59e0b}
+  .bar.danger{background:#ef4444}
+  .refresh{font-size:0.75rem;color:#475569;margin-bottom:16px}
+  .no-data{text-align:center;padding:40px;color:#475569}
+  .section-title{font-size:0.85rem;font-weight:600;color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.06em}
+</style>
+</head>
+<body>
+<h1>ServerKit Labs <span id="last-update">Loading...</span></h1>
+<div class="refresh">Auto-refreshes every 5 seconds</div>
+<div class="cards" id="cards"></div>
+<div class="section-title">Active Containers</div>
+<div id="table-wrap"></div>
+<script>
+const QS = '${qs}'
+function barClass(p){return p>80?'danger':p>60?'warn':''}
+function fmt(n,d=1){return n==null?'—':n.toFixed(d)}
+function fmtTime(s){if(s<=0)return'Expired';const m=Math.floor(s/60);const sec=s%60;return m+'m '+sec+'s'}
+function fmtDate(ts){return new Date(ts).toLocaleTimeString()}
+
+async function load(){
+  try{
+    const r=await fetch('/api/admin/stats'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    const d=j.data
+    document.getElementById('last-update').textContent='Updated '+new Date().toLocaleTimeString()
+
+    const slotColor=d.availableSlots===0?'red':d.availableSlots<=3?'yellow':'green'
+    document.getElementById('cards').innerHTML=\`
+      <div class="card">
+        <div class="card-label">Active Sessions</div>
+        <div class="card-value">\${d.activeSessions}</div>
+        <div class="card-sub">Max \${d.maxConcurrent}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Available Slots</div>
+        <div class="card-value \${slotColor}">\${d.availableSlots}</div>
+        <div class="card-sub">of \${d.maxConcurrent}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Total RAM Used</div>
+        <div class="card-value">\${fmt(d.totalMemUsageMB)}<span style="font-size:1rem;color:#94a3b8"> MB</span></div>
+        <div class="card-sub">across all containers</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Total CPU</div>
+        <div class="card-value">\${fmt(d.totalCpuPercent)}<span style="font-size:1rem;color:#94a3b8"> %</span></div>
+        <div class="card-sub">across all containers</div>
+      </div>
+    \`
+
+    if(d.containers.length===0){
+      document.getElementById('table-wrap').innerHTML='<div class="no-data">No active containers</div>'
+      return
+    }
+
+    const rows=d.containers.map(c=>{
+      const memP=c.memPercent??0
+      const cpuP=Math.min(c.cpuPercent??0,100)
+      const remaining=fmtTime(c.timeRemainingSeconds)
+      return \`<tr>
+        <td>\${c.uuid.slice(0,8)}…</td>
+        <td>\${c.containerId}</td>
+        <td>\${c.sshPort}</td>
+        <td><span class="badge running">running</span></td>
+        <td>
+          \${fmt(c.memUsageMB)} / \${fmt(c.memLimitMB)} MB
+          <span class="bar-wrap"><span class="bar \${barClass(memP)}" style="width:\${memP}%"></span></span>
+        </td>
+        <td>
+          \${fmt(c.cpuPercent)} %
+          <span class="bar-wrap"><span class="bar \${barClass(cpuP)}" style="width:\${cpuP}%"></span></span>
+        </td>
+        <td>\${remaining}</td>
+        <td>\${fmtDate(c.createdAt)}</td>
+      </tr>\`
+    }).join('')
+
+    document.getElementById('table-wrap').innerHTML=\`
+      <table>
+        <thead><tr>
+          <th>UUID</th><th>Container ID</th><th>SSH Port</th><th>Status</th>
+          <th>RAM</th><th>CPU</th><th>Expires</th><th>Started</th>
+        </tr></thead>
+        <tbody>\${rows}</tbody>
+      </table>
+    \`
+  }catch(e){
+    document.getElementById('last-update').textContent='Error loading'
+  }
+}
+load()
+setInterval(load,5000)
+</script>
+</body>
+</html>`
+}
 
 // Start server
 const start = async () => {
