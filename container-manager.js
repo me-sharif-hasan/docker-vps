@@ -208,31 +208,46 @@ function getStats() {
 }
 
 async function getDetailedStats() {
-  const now = Date.now()
+  // Query Docker directly — survives service restarts where sessions Map is empty
+  const running = await docker.listContainers({ filters: { name: ['lab-'] } })
   const containers = []
 
-  for (const [uuid, session] of sessions) {
+  for (const info of running) {
+    const containerName = (info.Names[0] || '').replace('/', '')
+    const uuid = containerName.replace(/^lab-/, '')
+    const session = sessions.get(uuid) // may be null if service restarted
+
     try {
-      const container = docker.getContainer(session.containerId)
+      const container = docker.getContainer(info.Id)
       const stats = await container.stats({ stream: false })
 
-      // CPU %
       const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage
       const sysDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage
       const numCpus = stats.cpu_stats.online_cpus || 1
       const cpuPercent = sysDelta > 0 ? (cpuDelta / sysDelta) * numCpus * 100 : 0
 
-      // RAM
       const memUsage = stats.memory_stats.usage || 0
       const memLimit = stats.memory_stats.limit || CONTAINER_MEMORY_LIMIT
 
+      const createdAt = info.Created * 1000
+      const expiresAt = session ? session.expiresAt : createdAt + SESSION_DURATION_MS
+      const timeRemainingSeconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
+
+      // Port from Docker inspect if session missing
+      const sshPort = session
+        ? session.sshPort
+        : (info.Ports.find(p => p.PrivatePort === 22) || {}).PublicPort || null
+
       containers.push({
         uuid,
-        containerId: session.containerId.slice(0, 12),
-        sshPort: session.sshPort,
-        createdAt: session.createdAt,
-        expiresAt: session.expiresAt,
-        timeRemainingSeconds: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
+        containerId: info.Id.slice(0, 12),
+        fullContainerId: info.Id,
+        containerName,
+        sshPort,
+        createdAt,
+        expiresAt,
+        timeRemainingSeconds,
+        orphaned: !session, // running in Docker but not in sessions Map
         cpuPercent: parseFloat(cpuPercent.toFixed(2)),
         memUsageMB: parseFloat((memUsage / MB).toFixed(1)),
         memLimitMB: parseFloat((memLimit / MB).toFixed(1)),
@@ -241,11 +256,14 @@ async function getDetailedStats() {
     } catch {
       containers.push({
         uuid,
-        containerId: session.containerId.slice(0, 12),
-        sshPort: session.sshPort,
-        createdAt: session.createdAt,
-        expiresAt: session.expiresAt,
-        timeRemainingSeconds: Math.max(0, Math.floor((session.expiresAt - now) / 1000)),
+        containerId: info.Id.slice(0, 12),
+        fullContainerId: info.Id,
+        containerName,
+        sshPort: null,
+        createdAt: info.Created * 1000,
+        expiresAt: null,
+        timeRemainingSeconds: null,
+        orphaned: !session,
         cpuPercent: null,
         memUsageMB: null,
         memLimitMB: null,
@@ -256,15 +274,36 @@ async function getDetailedStats() {
 
   const totalMemMB = containers.reduce((s, c) => s + (c.memUsageMB || 0), 0)
   const totalCpu = containers.reduce((s, c) => s + (c.cpuPercent || 0), 0)
+  const activeCount = running.length
 
   return {
-    activeSessions: sessions.size,
+    activeSessions: activeCount,
     maxConcurrent: MAX_CONCURRENT,
-    availableSlots: MAX_CONCURRENT - sessions.size,
+    availableSlots: Math.max(0, MAX_CONCURRENT - activeCount),
     totalMemUsageMB: parseFloat(totalMemMB.toFixed(1)),
     totalCpuPercent: parseFloat(totalCpu.toFixed(2)),
     containers
   }
+}
+
+async function forceDestroyContainer(containerId) {
+  const container = docker.getContainer(containerId)
+  const info = await container.inspect()
+  const name = (info.Name || '').replace('/', '')
+  const uuid = name.replace(/^lab-/, '')
+
+  await container.stop({ t: 3 }).catch(() => {})
+  await container.remove({ force: true })
+
+  // Clean up session if tracked
+  if (sessions.has(uuid)) {
+    const session = sessions.get(uuid)
+    if (session.timer) clearTimeout(session.timer)
+    usedPorts.delete(session.sshPort)
+    sessions.delete(uuid)
+  }
+
+  return { destroyed: true, containerId, containerName: name }
 }
 
 function isUuidConflict(uuid) {
@@ -274,6 +313,7 @@ function isUuidConflict(uuid) {
 module.exports = {
   provisionContainer,
   destroyContainer,
+  forceDestroyContainer,
   getConnectionDetails,
   getStats,
   getDetailedStats,

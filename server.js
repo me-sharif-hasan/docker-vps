@@ -5,6 +5,7 @@ const cors = require('@fastify/cors')
 const {
   provisionContainer,
   destroyContainer,
+  forceDestroyContainer,
   getConnectionDetails,
   getStats,
   getDetailedStats,
@@ -296,6 +297,16 @@ app.get('/api/admin/stats', async (request, reply) => {
   return { success: true, data: stats }
 })
 
+app.delete('/api/admin/containers/:containerId', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  try {
+    const result = await forceDestroyContainer(request.params.containerId)
+    return { success: true, data: result }
+  } catch (err) {
+    return reply.code(500).send({ success: false, error: err.message })
+  }
+})
+
 app.get('/dashboard', async (request, reply) => {
   if (checkAdminKey(request, reply) === false) return
   const adminKey = process.env.ADMIN_KEY ? `?key=${process.env.ADMIN_KEY}` : ''
@@ -329,10 +340,14 @@ function getDashboardHtml (qs) {
   tr:hover td{background:#252840}
   .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:600}
   .badge.running{background:#14532d;color:#4ade80}
+  .badge.orphaned{background:#451a03;color:#fb923c}
   .bar-wrap{background:#2d3148;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle;margin-left:6px}
   .bar{height:6px;border-radius:4px;background:#6366f1}
   .bar.warn{background:#f59e0b}
   .bar.danger{background:#ef4444}
+  .btn-destroy{background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:4px 10px;font-size:0.75rem;cursor:pointer;font-weight:600}
+  .btn-destroy:hover{background:#991b1b}
+  .btn-destroy:disabled{opacity:0.4;cursor:not-allowed}
   .refresh{font-size:0.75rem;color:#475569;margin-bottom:16px}
   .no-data{text-align:center;padding:40px;color:#475569}
   .section-title{font-size:0.85rem;font-weight:600;color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.06em}
@@ -350,6 +365,17 @@ function barClass(p){return p>80?'danger':p>60?'warn':''}
 function fmt(n,d=1){return n==null?'—':n.toFixed(d)}
 function fmtTime(s){if(s<=0)return'Expired';const m=Math.floor(s/60);const sec=s%60;return m+'m '+sec+'s'}
 function fmtDate(ts){return new Date(ts).toLocaleTimeString()}
+
+async function destroy(fullId,btn){
+  if(!confirm('Force destroy this container?'))return
+  btn.disabled=true
+  btn.textContent='Destroying…'
+  try{
+    const r=await fetch('/api/admin/containers/'+fullId+QS,{method:'DELETE'})
+    const j=await r.json()
+    if(j.success){load()}else{alert('Error: '+j.error);btn.disabled=false;btn.textContent='Destroy'}
+  }catch(e){alert('Request failed');btn.disabled=false;btn.textContent='Destroy'}
+}
 
 async function load(){
   try{
@@ -391,12 +417,15 @@ async function load(){
     const rows=d.containers.map(c=>{
       const memP=c.memPercent??0
       const cpuP=Math.min(c.cpuPercent??0,100)
-      const remaining=fmtTime(c.timeRemainingSeconds)
+      const remaining=c.timeRemainingSeconds!=null?fmtTime(c.timeRemainingSeconds):'—'
+      const statusBadge=c.orphaned
+        ?'<span class="badge orphaned">orphaned</span>'
+        :'<span class="badge running">running</span>'
       return \`<tr>
-        <td>\${c.uuid.slice(0,8)}…</td>
+        <td title="\${c.uuid}">\${c.uuid.slice(0,8)}…</td>
         <td>\${c.containerId}</td>
-        <td>\${c.sshPort}</td>
-        <td><span class="badge running">running</span></td>
+        <td>\${c.sshPort??'—'}</td>
+        <td>\${statusBadge}</td>
         <td>
           \${fmt(c.memUsageMB)} / \${fmt(c.memLimitMB)} MB
           <span class="bar-wrap"><span class="bar \${barClass(memP)}" style="width:\${memP}%"></span></span>
@@ -407,6 +436,7 @@ async function load(){
         </td>
         <td>\${remaining}</td>
         <td>\${fmtDate(c.createdAt)}</td>
+        <td><button class="btn-destroy" onclick="destroy('\${c.fullContainerId}',this)">Destroy</button></td>
       </tr>\`
     }).join('')
 
@@ -414,7 +444,7 @@ async function load(){
       <table>
         <thead><tr>
           <th>UUID</th><th>Container ID</th><th>SSH Port</th><th>Status</th>
-          <th>RAM</th><th>CPU</th><th>Expires</th><th>Started</th>
+          <th>RAM</th><th>CPU</th><th>Expires</th><th>Started</th><th></th>
         </tr></thead>
         <tbody>\${rows}</tbody>
       </table>
