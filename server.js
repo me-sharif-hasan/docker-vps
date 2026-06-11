@@ -2,6 +2,8 @@
 
 const Fastify = require('fastify')
 const cors = require('@fastify/cors')
+const fs = require('fs')
+const path = require('path')
 const {
   provisionContainer,
   destroyContainer,
@@ -14,10 +16,22 @@ const {
 const { isValidUuid } = require('./validate')
 const { verifyIntegrityToken, signLabsJwt, verifyLabsJwt } = require('./auth')
 
-// Settings storage: configurable options (in-memory)
-const settings = {
-  skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false
+// Settings — persisted to settings.json, survives restarts
+const SETTINGS_FILE = path.join(__dirname, 'settings.json')
+
+function loadSettings () {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+  } catch {
+    return { skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false }
+  }
 }
+
+function saveSettings () {
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
+}
+
+const settings = loadSettings()
 
 const app = Fastify({
   logger: {
@@ -68,13 +82,10 @@ app.post('/api/auth/integrity-token', async (request, reply) => {
     })
   }
 
-  // Check if debug packages are being skipped
+  // Skip Play Integrity for debug builds when setting is enabled
   if (settings.skipDebugPackages && packageName.endsWith('.debug')) {
-    return reply.code(403).send({
-      success: false,
-      error: 'Debug packages are not allowed. Package ends with .debug',
-      packageName
-    })
+    const token = signLabsJwt({ packageName, debug: true })
+    return { success: true, token, expiresIn: 3600 }
   }
 
   try {
@@ -331,6 +342,7 @@ app.post('/api/admin/settings', async (request, reply) => {
   const { skipDebugPackages } = request.body || {}
   if (typeof skipDebugPackages === 'boolean') {
     settings.skipDebugPackages = skipDebugPackages
+    saveSettings()
     return { success: true, data: settings }
   }
   return reply.code(400).send({
