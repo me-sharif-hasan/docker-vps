@@ -14,6 +14,11 @@ const {
 const { isValidUuid } = require('./validate')
 const { verifyIntegrityToken, signLabsJwt, verifyLabsJwt } = require('./auth')
 
+// Settings storage: configurable options (in-memory)
+const settings = {
+  skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false
+}
+
 const app = Fastify({
   logger: {
     transport: {
@@ -60,6 +65,15 @@ app.post('/api/auth/integrity-token', async (request, reply) => {
       success: false,
       error: 'Missing required fields. Expected: integrityToken (or integrity_token), packageName (or package_name)',
       received: Object.keys(request.body || {})
+    })
+  }
+
+  // Check if debug packages are being skipped
+  if (settings.skipDebugPackages && packageName.endsWith('.debug')) {
+    return reply.code(403).send({
+      success: false,
+      error: 'Debug packages are not allowed. Package ends with .debug',
+      packageName
     })
   }
 
@@ -307,6 +321,24 @@ app.delete('/api/admin/containers/:containerId', async (request, reply) => {
   }
 })
 
+app.get('/api/admin/settings', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return { success: true, data: settings }
+})
+
+app.post('/api/admin/settings', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const { skipDebugPackages } = request.body || {}
+  if (typeof skipDebugPackages === 'boolean') {
+    settings.skipDebugPackages = skipDebugPackages
+    return { success: true, data: settings }
+  }
+  return reply.code(400).send({
+    success: false,
+    error: 'Invalid request. Expected: { skipDebugPackages: boolean }'
+  })
+})
+
 app.get('/dashboard', async (request, reply) => {
   if (checkAdminKey(request, reply) === false) return
   const adminKey = process.env.ADMIN_KEY ? `?key=${process.env.ADMIN_KEY}` : ''
@@ -351,11 +383,28 @@ function getDashboardHtml (qs) {
   .refresh{font-size:0.75rem;color:#475569;margin-bottom:16px}
   .no-data{text-align:center;padding:40px;color:#475569}
   .section-title{font-size:0.85rem;font-weight:600;color:#94a3b8;margin-bottom:12px;text-transform:uppercase;letter-spacing:.06em}
+  .settings-box{background:#1e2130;border:1px solid #2d3148;border-radius:12px;padding:16px;margin-bottom:24px}
+  .setting-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #2d3148}
+  .setting-item:last-child{border-bottom:none}
+  .setting-label{font-size:0.85rem;font-weight:500}
+  .toggle-switch{position:relative;width:44px;height:24px;background:#334155;border-radius:12px;cursor:pointer;transition:background 0.2s}
+  .toggle-switch.active{background:#22c55e}
+  .toggle-switch .slider{position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;transition:left 0.2s}
+  .toggle-switch.active .slider{left:22px}
 </style>
 </head>
 <body>
 <h1>ServerKit Labs <span id="last-update">Loading...</span></h1>
 <div class="refresh">Auto-refreshes every 5 seconds</div>
+<div class="settings-box">
+  <div class="section-title">Settings</div>
+  <div class="setting-item">
+    <span class="setting-label">Skip Debug Packages (.debug)</span>
+    <div class="toggle-switch" id="skip-debug-toggle" onclick="toggleSkipDebug()">
+      <div class="slider"></div>
+    </div>
+  </div>
+</div>
 <div class="cards" id="cards"></div>
 <div class="section-title">Active Containers</div>
 <div id="table-wrap"></div>
@@ -365,6 +414,31 @@ function barClass(p){return p>80?'danger':p>60?'warn':''}
 function fmt(n,d=1){return n==null?'—':n.toFixed(d)}
 function fmtTime(s){if(s<=0)return'Expired';const m=Math.floor(s/60);const sec=s%60;return m+'m '+sec+'s'}
 function fmtDate(ts){return new Date(ts).toLocaleTimeString()}
+
+async function toggleSkipDebug(){
+  try{
+    const r=await fetch('/api/admin/settings'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    const newVal=!j.data.skipDebugPackages
+    const ur=await fetch('/api/admin/settings'+QS,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({skipDebugPackages:newVal})
+    })
+    const uj=await ur.json()
+    if(uj.success){updateSkipDebugUI(uj.data.skipDebugPackages)}
+  }catch(e){alert('Failed to toggle setting')}
+}
+
+function updateSkipDebugUI(enabled){
+  const toggle=document.getElementById('skip-debug-toggle')
+  if(enabled){
+    toggle.classList.add('active')
+  }else{
+    toggle.classList.remove('active')
+  }
+}
 
 async function destroy(fullId,btn){
   if(!confirm('Force destroy this container?'))return
@@ -379,6 +453,10 @@ async function destroy(fullId,btn){
 
 async function load(){
   try{
+    const sr=await fetch('/api/admin/settings'+QS)
+    const sj=await sr.json()
+    if(sj.success){updateSkipDebugUI(sj.data.skipDebugPackages)}
+
     const r=await fetch('/api/admin/stats'+QS)
     const j=await r.json()
     if(!j.success)return
