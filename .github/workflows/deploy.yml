@@ -1,0 +1,54 @@
+name: Deploy to serverkitlabs
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Deploy to server
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -t rsa "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ubuntu@$SSH_HOST << 'EOF'
+            set -e
+            echo "Deploying ServerKit Labs..."
+            cd ~/docker-vps || mkdir -p ~/docker-vps && cd ~/docker-vps
+
+            # Initialize git repo if not already
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin https://github.com/me-sharif-hasan/docker-vps.git
+            fi
+
+            # Fetch latest code
+            git fetch origin main
+            git checkout -f origin/main
+
+            # Install/update dependencies
+            npm install --production
+
+            # Restart the service
+            if pm2 list | grep -q "serverkit-labs"; then
+              pm2 restart serverkit-labs
+              echo "Service restarted successfully"
+            else
+              pm2 start server.js --name serverkit-labs
+              echo "Service started successfully"
+            fi
+
+            echo "Deployment completed!"
+          EOF
