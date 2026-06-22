@@ -15,12 +15,12 @@ function getServiceAccountPath() {
   const oldPath = path.join(__dirname, 'service-account.json')
 
   if (fs.existsSync(newPath)) {
-    console.log('[Auth] Using serviceaccount-new.json')
+    console.log('[Auth] ✓ Using serviceaccount-new.json')
     return newPath
   }
 
   if (fs.existsSync(oldPath)) {
-    console.log('[Auth] Using service-account.json (fallback)')
+    console.log('[Auth] ✓ Using service-account.json (fallback)')
     return oldPath
   }
 
@@ -28,33 +28,74 @@ function getServiceAccountPath() {
 }
 
 const SERVICE_ACCOUNT_PATH = getServiceAccountPath()
+console.log('[Auth] Service account path:', SERVICE_ACCOUNT_PATH)
 
 const googleAuth = new GoogleAuth({
   keyFile: SERVICE_ACCOUNT_PATH,
   scopes: [PLAY_INTEGRITY_SCOPE]
 })
 
-async function verifyIntegrityToken (integrityToken, packageName) {
-  const client = await googleAuth.getClient()
-  const accessToken = await client.getAccessToken()
+let currentGoogleAuth = googleAuth
 
+async function verifyIntegrityToken (integrityToken, packageName) {
   const url = `https://playintegrity.googleapis.com/v1/${encodeURIComponent(packageName)}:decodeIntegrityToken`
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken.token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ integrity_token: integrityToken })
-  })
+  try {
+    const client = await currentGoogleAuth.getClient()
+    const accessToken = await client.getAccessToken()
 
-  if (!res.ok) {
-    const errBody = await res.text()
-    throw new Error(`Play Integrity API error ${res.status}: ${errBody}`)
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ integrity_token: integrityToken })
+    })
+
+    if (!res.ok) {
+      const errBody = await res.text()
+      throw new Error(`Play Integrity API error ${res.status}: ${errBody}`)
+    }
+
+    return res.json()
+  } catch (err) {
+    // Try fallback to old service account if new one fails
+    const newPath = path.join(__dirname, 'serviceaccount-new.json')
+    const oldPath = path.join(__dirname, 'service-account.json')
+    const currentPath = SERVICE_ACCOUNT_PATH
+
+    if (currentPath === newPath && fs.existsSync(oldPath)) {
+      console.log('[Auth] ⚠️  New service account failed, trying fallback: service-account.json')
+
+      const fallbackAuth = new GoogleAuth({
+        keyFile: oldPath,
+        scopes: [PLAY_INTEGRITY_SCOPE]
+      })
+
+      const client = await fallbackAuth.getClient()
+      const accessToken = await client.getAccessToken()
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken.token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ integrity_token: integrityToken })
+      })
+
+      if (!res.ok) {
+        const errBody = await res.text()
+        throw new Error(`Play Integrity API error (fallback) ${res.status}: ${errBody}`)
+      }
+
+      console.log('[Auth] ✓ Fallback succeeded with service-account.json')
+      return res.json()
+    }
+
+    throw err
   }
-
-  return res.json()
 }
 
 function signLabsJwt (payload) {
