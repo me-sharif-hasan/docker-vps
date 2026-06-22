@@ -3,11 +3,31 @@
 const { GoogleAuth } = require('google-auth-library')
 const jwt = require('jsonwebtoken')
 const path = require('path')
+const fs = require('fs')
 
-const SERVICE_ACCOUNT_PATH = path.join(__dirname, 'service-account.json')
 const PLAY_INTEGRITY_SCOPE = 'https://www.googleapis.com/auth/playintegrity'
 const JWT_SECRET = process.env.JWT_SECRET
 const JWT_EXPIRY = '1h'
+
+// Try new service account first, fall back to old one for backward compatibility
+function getServiceAccountPath() {
+  const newPath = path.join(__dirname, 'serviceaccount-new.json')
+  const oldPath = path.join(__dirname, 'service-account.json')
+
+  if (fs.existsSync(newPath)) {
+    console.log('[Auth] Using serviceaccount-new.json')
+    return newPath
+  }
+
+  if (fs.existsSync(oldPath)) {
+    console.log('[Auth] Using service-account.json (fallback)')
+    return oldPath
+  }
+
+  throw new Error('No service account file found. Expected: serviceaccount-new.json or service-account.json')
+}
+
+const SERVICE_ACCOUNT_PATH = getServiceAccountPath()
 
 const googleAuth = new GoogleAuth({
   keyFile: SERVICE_ACCOUNT_PATH,

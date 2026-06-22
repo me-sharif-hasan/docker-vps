@@ -3,4 +3,5 @@ node_modules/
 *.pem
 *.key
 service-account.json
+serviceaccount-new.json
 settings.json
