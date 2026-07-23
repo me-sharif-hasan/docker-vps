@@ -43,9 +43,14 @@ jobs:
             # Install/update dependencies
             npm install --production
 
+            # Load environment config for the app
+            set -a
+            [ -f .env ] && . .env
+            set +a
+
             # Restart the service
             if pm2 list | grep -q "serverkit-labs"; then
-              pm2 restart serverkit-labs
+              pm2 restart serverkit-labs --update-env
               echo "Service restarted successfully"
             else
               pm2 start server.js --name serverkit-labs
