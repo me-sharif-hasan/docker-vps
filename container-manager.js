@@ -1,16 +1,23 @@
 'use strict'
 
-const Docker = require('dockerode')
-const { execSync, exec } = require('child_process')
+const { execFile } = require('child_process')
 const { promisify } = require('util')
-const execAsync = promisify(exec)
-const crypto = require('crypto')
+const execFileAsync = promisify(execFile)
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
 
-const docker = new Docker({ socketPath: '/var/run/docker.sock' })
-
+// Podman (not Docker) runs the lab containers. Reason: labs run full systemd
+// as PID 1 (so labuser gets a real serviceable VPS, not just a bare shell),
+// and systemd needs read-write control of its own cgroup subtree. Docker/runc
+// only grants that via --privileged (which also hands the container every
+// host device, e.g. real disks — the exact vulnerability this replaced) or
+// --cgroupns=host (which shares the host's cgroup tree, letting a container
+// tamper with unrelated host services' resource limits). Podman's
+// --systemd=always uses crun's proper per-container cgroup delegation:
+// systemd gets a writable, but genuinely isolated, cgroup view — verified
+// manually that a container cannot reach any cgroup outside its own, and
+// cannot mknod/mount any real device, all without Privileged or extra caps.
 const IMAGE_NAME = 'serverkit-lab'
 const MAX_CONCURRENT = 10
 const SESSION_DURATION_MS = 30 * 60 * 1000 // 30 minutes
@@ -30,6 +37,10 @@ const sessions = new Map()
 // Track which ports are in use
 const usedPorts = new Set()
 
+function podman(args) {
+  return execFileAsync('podman', args, { maxBuffer: 10 * MB })
+}
+
 function getRandomPort() {
   const available = []
   for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
@@ -42,7 +53,7 @@ function getRandomPort() {
 async function generateSshKeyPair() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lab-key-'))
   const keyPath = path.join(tmpDir, 'id_rsa')
-  await execAsync(`ssh-keygen -t rsa -b 2048 -f ${keyPath} -N "" -C "serverkit-lab"`)
+  await execFileAsync('ssh-keygen', ['-t', 'rsa', '-b', '2048', '-f', keyPath, '-N', '', '-C', 'serverkit-lab'])
   const privateKey = fs.readFileSync(keyPath, 'utf8')
   const publicKey = fs.readFileSync(`${keyPath}.pub`, 'utf8')
   // Clean up temp files
@@ -52,30 +63,42 @@ async function generateSshKeyPair() {
 
 async function buildImageIfNeeded() {
   try {
-    await docker.getImage(IMAGE_NAME).inspect()
+    await podman(['image', 'inspect', IMAGE_NAME])
     return // already exists
   } catch {
-    // Image doesn't exist, build it
     const dockerfilePath = path.join(__dirname, 'docker')
-    const stream = await docker.buildImage(
-      { context: dockerfilePath, src: ['Dockerfile'] },
-      { t: IMAGE_NAME }
-    )
-    await new Promise((resolve, reject) => {
-      docker.modem.followProgress(stream, (err) => err ? reject(err) : resolve())
-    })
+    await podman(['build', '-t', IMAGE_NAME, dockerfilePath])
   }
 }
 
-async function createContainerWithFallback(config) {
+async function createContainer(uuid, publicKey, sshPort) {
+  const args = [
+    'run', '-d',
+    '--name', `lab-${uuid}`,
+    '--systemd', 'always',
+    '-e', `LAB_PUBLIC_KEY=${publicKey.trim()}`,
+    '-e', `LAB_UUID=${uuid}`,
+    '-p', `${sshPort}:22`,
+    '--memory', String(CONTAINER_MEMORY_LIMIT),
+    '--memory-swap', String(CONTAINER_MEMORY_SWAP),
+    '--cpus', String(CONTAINER_CPU_QUOTA / CONTAINER_CPU_PERIOD),
+    '--tmpfs', '/run:rw,noexec,nosuid,size=65536k',
+    '--tmpfs', '/run/lock:rw,noexec,nosuid,size=65536k',
+    '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m',
+    '--storage-opt', `size=${CONTAINER_DISK_LIMIT}`,
+    IMAGE_NAME
+  ]
+
   try {
-    return await docker.createContainer(config)
+    const { stdout } = await podman(args)
+    return stdout.trim()
   } catch (err) {
     if (err.message && err.message.includes('storage')) {
-      // StorageOpt not supported by this storage driver — retry without it
-      const fallback = { ...config, HostConfig: { ...config.HostConfig } }
-      delete fallback.HostConfig.StorageOpt
-      return await docker.createContainer(fallback)
+      // storage-opt size not supported by this storage driver — retry without it
+      const idx = args.indexOf('--storage-opt')
+      const fallback = [...args.slice(0, idx), ...args.slice(idx + 2)]
+      const { stdout } = await podman(fallback)
+      return stdout.trim()
     }
     throw err
   }
@@ -96,39 +119,12 @@ async function provisionContainer(uuid) {
   const sshPort = getRandomPort()
   usedPorts.add(sshPort)
 
-  const container = await createContainerWithFallback({
-    Image: IMAGE_NAME,
-    name: `lab-${uuid}`,
-    Env: [
-      `LAB_PUBLIC_KEY=${publicKey.trim()}`,
-      `LAB_UUID=${uuid}`
-    ],
-    ExposedPorts: { '22/tcp': {} },
-    HostConfig: {
-      PortBindings: {
-        '22/tcp': [{ HostPort: String(sshPort) }]
-      },
-      Privileged: true,
-      Tmpfs: {
-        '/run':      'rw,noexec,nosuid,size=65536k',
-        '/run/lock': 'rw,noexec,nosuid,size=65536k',
-        '/tmp':      'rw,noexec,nosuid,size=128m'
-      },
-      Memory:      CONTAINER_MEMORY_LIMIT,
-      MemorySwap:  CONTAINER_MEMORY_SWAP,
-      CpuQuota:    CONTAINER_CPU_QUOTA,
-      CpuPeriod:   CONTAINER_CPU_PERIOD,
-      StorageOpt:  { size: CONTAINER_DISK_LIMIT },
-      NetworkMode: 'bridge'
-    }
-  })
-
-  await container.start()
+  const containerId = await createContainer(uuid, publicKey, sshPort)
 
   const expiresAt = Date.now() + SESSION_DURATION_MS
   const session = {
     uuid,
-    containerId: container.id,
+    containerId,
     sshPort,
     privateKey,
     publicKey,
@@ -164,13 +160,7 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
     clearTimeout(session.timer)
   }
 
-  try {
-    const container = docker.getContainer(session.containerId)
-    await container.stop({ t: 3 }).catch(() => {}) // ignore if already stopped
-    await container.remove({ force: true }).catch(() => {})
-  } catch {
-    // Container may already be gone — that's fine
-  }
+  await podman(['rm', '-f', session.containerId]).catch(() => {})
 
   usedPorts.delete(session.sshPort)
   sessions.delete(uuid)
@@ -208,35 +198,37 @@ function getStats() {
 }
 
 async function getDetailedStats() {
-  // Query Docker directly — survives service restarts where sessions Map is empty
-  const running = await docker.listContainers({ filters: { name: ['lab-'] } })
+  // Query Podman directly — survives service restarts where sessions Map is empty
+  const { stdout } = await podman([
+    'ps', '-a', '--filter', 'name=^lab-', '--format', 'json'
+  ])
+  const running = JSON.parse(stdout || '[]')
   const containers = []
 
   for (const info of running) {
-    const containerName = (info.Names[0] || '').replace('/', '')
+    const containerName = (info.Names && info.Names[0]) || ''
     const uuid = containerName.replace(/^lab-/, '')
     const session = sessions.get(uuid) // may be null if service restarted
 
     try {
-      const container = docker.getContainer(info.Id)
-      const stats = await container.stats({ stream: false })
+      const { stdout: statsOut } = await podman([
+        'stats', '--no-stream', '--format', 'json', info.Id
+      ])
+      const stats = JSON.parse(statsOut)[0]
 
-      const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage
-      const sysDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage
-      const numCpus = stats.cpu_stats.online_cpus || 1
-      const cpuPercent = sysDelta > 0 ? (cpuDelta / sysDelta) * numCpus * 100 : 0
-
-      const memUsage = stats.memory_stats.usage || 0
-      const memLimit = stats.memory_stats.limit || CONTAINER_MEMORY_LIMIT
+      const cpuPercent = parseFloat(String(stats.cpu_percent || '0').replace('%', '')) || 0
+      const [memUsageStr] = String(stats.mem_usage || '0B / 0B').split('/')
+      const memUsageMB = parseMemToMB(memUsageStr)
+      const memLimitMB = CONTAINER_MEMORY_LIMIT / MB
 
       const createdAt = info.Created * 1000
       const expiresAt = session ? session.expiresAt : createdAt + SESSION_DURATION_MS
       const timeRemainingSeconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
 
-      // Port from Docker inspect if session missing
+      const portEntry = (info.Ports || []).find(p => p.container_port === 22 || p.container_port === '22')
       const sshPort = session
         ? session.sshPort
-        : (info.Ports.find(p => p.PrivatePort === 22) || {}).PublicPort || null
+        : (portEntry ? portEntry.host_port : null)
 
       containers.push({
         uuid,
@@ -247,11 +239,11 @@ async function getDetailedStats() {
         createdAt,
         expiresAt,
         timeRemainingSeconds,
-        orphaned: !session, // running in Docker but not in sessions Map
+        orphaned: !session, // running in Podman but not in sessions Map
         cpuPercent: parseFloat(cpuPercent.toFixed(2)),
-        memUsageMB: parseFloat((memUsage / MB).toFixed(1)),
-        memLimitMB: parseFloat((memLimit / MB).toFixed(1)),
-        memPercent: parseFloat(((memUsage / memLimit) * 100).toFixed(1))
+        memUsageMB: parseFloat(memUsageMB.toFixed(1)),
+        memLimitMB: parseFloat(memLimitMB.toFixed(1)),
+        memPercent: parseFloat(((memUsageMB / memLimitMB) * 100).toFixed(1))
       })
     } catch {
       containers.push({
@@ -286,14 +278,22 @@ async function getDetailedStats() {
   }
 }
 
+function parseMemToMB(str) {
+  const m = String(str).trim().match(/^([\d.]+)\s*([KMGT]?i?B)?$/i)
+  if (!m) return 0
+  const value = parseFloat(m[1])
+  const unit = (m[2] || 'B').toUpperCase()
+  const factors = { B: 1, KB: 1024, KIB: 1024, MB: MB, MIB: MB, GB: MB * 1024, GIB: MB * 1024, TB: MB * 1024 * 1024, TIB: MB * 1024 * 1024 }
+  const bytes = value * (factors[unit] || 1)
+  return bytes / MB
+}
+
 async function forceDestroyContainer(containerId) {
-  const container = docker.getContainer(containerId)
-  const info = await container.inspect()
-  const name = (info.Name || '').replace('/', '')
+  const { stdout } = await podman(['inspect', containerId, '--format', '{{.Name}}'])
+  const name = stdout.trim().replace(/^\//, '')
   const uuid = name.replace(/^lab-/, '')
 
-  await container.stop({ t: 3 }).catch(() => {})
-  await container.remove({ force: true })
+  await podman(['rm', '-f', containerId])
 
   // Clean up session if tracked
   if (sessions.has(uuid)) {

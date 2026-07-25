@@ -3,6 +3,10 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=docker
 
+# This host's docker bridge network has no IPv6 route, but apt's mirror DNS
+# sometimes returns IPv6-only records — force IPv4 so apt-get doesn't hang.
+RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     systemd \
     systemd-sysv \
