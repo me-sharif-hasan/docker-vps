@@ -41,6 +41,48 @@ function podman(args) {
   return execFileAsync('podman', args, { maxBuffer: 10 * MB })
 }
 
+// Lab SSH ports (32000-33000) aren't open by default — ufw denies incoming
+// by default and nothing else opens this range. Each port is opened only
+// for the lifetime of its container and tagged with a comment so it can be
+// identified/rolled back, including by the startup reconciliation below in
+// case the process died before it got a chance to close a rule itself.
+function firewallComment(uuid) {
+  return `lab-${uuid}`
+}
+
+async function openFirewallPort(uuid, port) {
+  await execFileAsync('sudo', ['ufw', 'allow', `${port}/tcp`, 'comment', firewallComment(uuid)])
+}
+
+async function closeFirewallPort(port) {
+  await execFileAsync('sudo', ['ufw', '--force', 'delete', 'allow', `${port}/tcp`]).catch(() => {})
+}
+
+// On startup, sessions are empty (in-memory) but ufw rules and podman
+// containers from before a restart/crash may still exist. Reconcile: drop
+// any lab- firewall rule whose container is gone, so ports don't leak open.
+async function reconcileFirewallRules() {
+  try {
+    const { stdout } = await podman(['ps', '-a', '--filter', 'name=^lab-', '--format', '{{.Names}}'])
+    const liveNames = new Set(stdout.split('\n').map(s => s.trim()).filter(Boolean))
+
+    const { stdout: ufwOut } = await execFileAsync('sudo', ['ufw', 'status'])
+    const rulePortsByComment = ufwOut
+      .split('\n')
+      .map(line => line.match(/^(\d+)\/tcp\b.*#\s*(lab-\S+)/))
+      .filter(Boolean)
+      .map(m => ({ port: m[1], uuid: m[2].replace(/^lab-/, '') }))
+
+    for (const { port, uuid } of rulePortsByComment) {
+      if (!liveNames.has(`lab-${uuid}`)) {
+        await closeFirewallPort(port)
+      }
+    }
+  } catch (err) {
+    console.error('Firewall reconciliation failed:', err.message)
+  }
+}
+
 function getRandomPort() {
   const available = []
   for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
@@ -119,7 +161,15 @@ async function provisionContainer(uuid) {
   const sshPort = getRandomPort()
   usedPorts.add(sshPort)
 
-  const containerId = await createContainer(uuid, publicKey, sshPort)
+  let containerId
+  try {
+    containerId = await createContainer(uuid, publicKey, sshPort)
+    await openFirewallPort(uuid, sshPort)
+  } catch (err) {
+    usedPorts.delete(sshPort)
+    if (containerId) await podman(['rm', '-f', containerId]).catch(() => {})
+    throw err
+  }
 
   const expiresAt = Date.now() + SESSION_DURATION_MS
   const session = {
@@ -161,6 +211,7 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
   }
 
   await podman(['rm', '-f', session.containerId]).catch(() => {})
+  await closeFirewallPort(session.sshPort)
 
   usedPorts.delete(session.sshPort)
   sessions.delete(uuid)
@@ -293,11 +344,20 @@ async function forceDestroyContainer(containerId) {
   const name = stdout.trim().replace(/^\//, '')
   const uuid = name.replace(/^lab-/, '')
 
+  const session = sessions.get(uuid)
+  let sshPort = session ? session.sshPort : null
+  if (!sshPort) {
+    try {
+      const { stdout: portOut } = await podman(['inspect', containerId, '--format', '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}'])
+      sshPort = parseInt(portOut.trim(), 10) || null
+    } catch { /* container may already be gone */ }
+  }
+
   await podman(['rm', '-f', containerId])
+  if (sshPort) await closeFirewallPort(sshPort)
 
   // Clean up session if tracked
-  if (sessions.has(uuid)) {
-    const session = sessions.get(uuid)
+  if (session) {
     if (session.timer) clearTimeout(session.timer)
     usedPorts.delete(session.sshPort)
     sessions.delete(uuid)
@@ -309,6 +369,8 @@ async function forceDestroyContainer(containerId) {
 function isUuidConflict(uuid) {
   return sessions.has(uuid)
 }
+
+reconcileFirewallRules()
 
 module.exports = {
   provisionContainer,
