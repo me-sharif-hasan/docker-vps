@@ -58,25 +58,45 @@ async function closeFirewallPort(port) {
   await execFileAsync('sudo', ['ufw', '--force', 'delete', 'allow', `${port}/tcp`]).catch(() => {})
 }
 
-// On startup, sessions are empty (in-memory) but ufw rules and podman
-// containers from before a restart/crash may still exist. Reconcile: drop
-// any lab- firewall rule whose container is gone, so ports don't leak open.
+// On startup, sessions are empty (in-memory, wiped by every restart/deploy)
+// but ufw rules and podman containers from before the restart may still
+// exist, and can now disagree with each other. Reconcile both directions:
+//  - a rule whose container is gone gets closed (crash before cleanup ran)
+//  - a still-running container missing its rule gets opened (a session that
+//    survived a restart, e.g. because the deploy hit mid-session, would
+//    otherwise be silently unreachable from outside for the rest of its
+//    lifetime with no way for the client to notice)
+// Also repopulates usedPorts so a fresh process doesn't hand out a port a
+// surviving container is already bound to.
 async function reconcileFirewallRules() {
   try {
-    const { stdout } = await podman(['ps', '-a', '--filter', 'name=^lab-', '--format', '{{.Names}}'])
-    const liveNames = new Set(stdout.split('\n').map(s => s.trim()).filter(Boolean))
+    const { stdout } = await podman(['ps', '-a', '--filter', 'name=^lab-', '--format', 'json'])
+    const live = JSON.parse(stdout || '[]')
+    const livePortByUuid = new Map()
+    for (const info of live) {
+      const name = (info.Names && info.Names[0]) || ''
+      const uuid = name.replace(/^lab-/, '')
+      const portEntry = (info.Ports || []).find(p => p.container_port === 22 || p.container_port === '22')
+      if (portEntry) {
+        livePortByUuid.set(uuid, portEntry.host_port)
+        usedPorts.add(portEntry.host_port)
+      }
+    }
 
     const { stdout: ufwOut } = await execFileAsync('sudo', ['ufw', 'status'])
-    const rulePortsByComment = ufwOut
-      .split('\n')
-      .map(line => line.match(/^(\d+)\/tcp\b.*#\s*(lab-\S+)/))
-      .filter(Boolean)
-      .map(m => ({ port: m[1], uuid: m[2].replace(/^lab-/, '') }))
+    const rulesByUuid = new Map(
+      ufwOut
+        .split('\n')
+        .map(line => line.match(/^(\d+)\/tcp\b.*#\s*(lab-\S+)/))
+        .filter(Boolean)
+        .map(m => [m[2].replace(/^lab-/, ''), m[1]])
+    )
 
-    for (const { port, uuid } of rulePortsByComment) {
-      if (!liveNames.has(`lab-${uuid}`)) {
-        await closeFirewallPort(port)
-      }
+    for (const [uuid, port] of rulesByUuid) {
+      if (!livePortByUuid.has(uuid)) await closeFirewallPort(port)
+    }
+    for (const [uuid, port] of livePortByUuid) {
+      if (!rulesByUuid.has(uuid)) await openFirewallPort(uuid, port)
     }
   } catch (err) {
     console.error('Firewall reconciliation failed:', err.message)
