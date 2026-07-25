@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     lsof \
     lsb-release \
+    ufw \
     && rm -rf /var/lib/apt/lists/*
 
 # Mask heavy/irrelevant units — keep only what a real server needs

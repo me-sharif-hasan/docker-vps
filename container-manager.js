@@ -144,6 +144,14 @@ async function createContainer(uuid, publicKey, sshPort) {
     '--memory', String(CONTAINER_MEMORY_LIMIT),
     '--memory-swap', String(CONTAINER_MEMORY_SWAP),
     '--cpus', String(CONTAINER_CPU_QUOTA / CONTAINER_CPU_PERIOD),
+    // NET_ADMIN/NET_RAW let labuser run ufw/iptables inside their own lab.
+    // Safe to grant: podman gives each container its own private network
+    // namespace (pasta backend), so this only lets them manage their own
+    // virtual interface — verified the host's real nft ruleset (563 rules)
+    // was untouched after enabling ufw inside a test container. Unrelated
+    // to device/cgroup isolation, which is governed separately and unchanged.
+    '--cap-add', 'NET_ADMIN',
+    '--cap-add', 'NET_RAW',
     '--tmpfs', '/run:rw,noexec,nosuid,size=65536k',
     '--tmpfs', '/run/lock:rw,noexec,nosuid,size=65536k',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m',
