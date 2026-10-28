@@ -44,6 +44,15 @@ function saveSettings () {
 const settings = loadSettings()
 
 const app = Fastify({
+  // Trust X-Forwarded-For / X-Real-IP only when the connecting socket is
+  // the local nginx (127.0.0.1/::1) — i.e. only on requests that actually
+  // came through the reverse proxy. Without a scoped list here, trustProxy
+  // would either (a) left unset: always see nginx's loopback IP as
+  // request.ip, breaking the debug-whitelist IP check entirely, or
+  // (b) set to `true`: trust the header unconditionally, letting anyone
+  // who reaches the app directly (e.g. its bound port before/without a
+  // firewall rule) spoof X-Forwarded-For to impersonate a whitelisted IP.
+  trustProxy: ['127.0.0.1', '::1'],
   logger: {
     transport: {
       target: 'pino-pretty',
