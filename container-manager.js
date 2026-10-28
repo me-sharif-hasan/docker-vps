@@ -55,6 +55,15 @@ const FIREWALL_RECONCILE_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 // In-memory store: uuid -> session info
 const sessions = new Map()
 
+// deviceId -> uuid. Caps one active free session per device: without this,
+// provisioning is anonymous-per-request (any caller just picks its own
+// uuid), so closing the app and reopening it — or simply calling provision
+// again with a fresh uuid — got a brand new 30-minute session for free with
+// an old one still running. deviceId is a random id the client generates
+// once and persists itself; this map is how the one-active-session rule is
+// actually enforced, not merely assumed client-side.
+const deviceSessions = new Map()
+
 // Track which ports are in use
 const usedPorts = new Set()
 
@@ -222,9 +231,29 @@ async function createContainer(uuid, publicKey, sshPort) {
   }
 }
 
-async function provisionContainer(uuid) {
+async function provisionContainer(uuid, deviceId) {
   if (sessions.has(uuid)) {
     throw new Error('UUID already exists')
+  }
+
+  if (deviceId) {
+    const existingUuid = deviceSessions.get(deviceId)
+    const existingSession = existingUuid ? sessions.get(existingUuid) : null
+    if (existingSession) {
+      // Already has a live session — hand that one back instead of
+      // starting a second one. Shaped like a fresh provision's result
+      // (sshPort, not port — server.js's route reads result.sshPort).
+      const now = Date.now()
+      return {
+        uuid: existingSession.uuid,
+        sshPort: existingSession.sshPort,
+        privateKey: existingSession.privateKey,
+        user: 'labuser',
+        expiresAt: existingSession.expiresAt,
+        timeRemainingSeconds: Math.max(0, Math.floor((existingSession.expiresAt - now) / 1000))
+      }
+    }
+    if (existingUuid) deviceSessions.delete(deviceId) // stale, session ended since
   }
 
   if (sessions.size >= MAX_CONCURRENT) {
@@ -256,10 +285,12 @@ async function provisionContainer(uuid) {
     publicKey,
     createdAt: Date.now(),
     expiresAt,
-    status: 'running'
+    status: 'running',
+    deviceId
   }
 
   sessions.set(uuid, session)
+  if (deviceId) deviceSessions.set(deviceId, uuid)
 
   // Auto-terminate after 30 mins
   const timer = setTimeout(() => destroyContainer(uuid, true), SESSION_DURATION_MS)
@@ -291,6 +322,7 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
 
   usedPorts.delete(session.sshPort)
   sessions.delete(uuid)
+  if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
 
   return { uuid, destroyed: true, reason: isAutoExpiry ? 'expired' : 'manual' }
 }
@@ -437,6 +469,7 @@ async function forceDestroyContainer(containerId) {
     if (session.timer) clearTimeout(session.timer)
     usedPorts.delete(session.sshPort)
     sessions.delete(uuid)
+    if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
   }
 
   return { destroyed: true, containerId, containerName: name }

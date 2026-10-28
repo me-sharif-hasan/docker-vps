@@ -169,8 +169,11 @@ app.post('/api/auth/integrity-token', async (request, reply) => {
 
 // ─────────────────────────────────────────────
 // POST /labs/provision
-// Body: { uuid: string }
-// Creates a new lab container for the given UUID
+// Body: { uuid: string, deviceId?: string }
+// Creates a new lab container for the given UUID. deviceId is an opaque,
+// client-generated id (not tied to this uuid) used to cap one active free
+// session per install — see provisionContainer's own comment on why this
+// exists at all.
 // Returns: ssh connection details + private key
 // ─────────────────────────────────────────────
 app.post('/labs/provision', {
@@ -179,7 +182,8 @@ app.post('/labs/provision', {
       type: 'object',
       required: ['uuid'],
       properties: {
-        uuid: { type: 'string' }
+        uuid: { type: 'string' },
+        deviceId: { type: 'string', maxLength: 128 }
       }
     },
     response: {
@@ -205,7 +209,7 @@ app.post('/labs/provision', {
     }
   }
 }, async (request, reply) => {
-  const { uuid } = request.body
+  const { uuid, deviceId } = request.body
 
   if (!isValidUuid(uuid)) {
     return reply.code(400).send({
@@ -222,7 +226,7 @@ app.post('/labs/provision', {
   }
 
   try {
-    const result = await provisionContainer(uuid)
+    const result = await provisionContainer(uuid, deviceId)
     const host = process.env.HOST_IP || '127.0.0.1'
 
     return {
