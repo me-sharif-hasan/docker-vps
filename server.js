@@ -2,6 +2,9 @@
 
 const Fastify = require('fastify')
 const cors = require('@fastify/cors')
+const rateLimit = require('@fastify/rate-limit')
+const { getRecentActivity, getSuspiciousDevices } = require('./activity')
+const { getEgressFirewallStatus } = require('./firewall-egress')
 const {
   provisionContainer,
   destroyContainer,
@@ -43,6 +46,11 @@ const app = Fastify({
 
 app.register(cors, { origin: true })
 
+// Global default - generous, just stops naive flooding. /labs/provision
+// below gets a much tighter per-route override since that's the one
+// endpoint that actually costs resources (spins up a container).
+app.register(rateLimit, { max: 60, timeWindow: '1 minute' })
+
 // ─────────────────────────────────────────────
 // JWT bearer guard on all /labs/* routes
 //
@@ -78,7 +86,9 @@ app.addHook('onRequest', async (request, reply) => {
 // Body: { integrityToken: string, packageName: string }
 // Returns: { token: string } (JWT, 1hr)
 // ─────────────────────────────────────────────
-app.post('/api/auth/integrity-token', async (request, reply) => {
+app.post('/api/auth/integrity-token', {
+  config: { rateLimit: { max: 20, timeWindow: '1 minute' } }
+}, async (request, reply) => {
   app.log.info({ body: request.body }, 'integrity-token raw body')
 
   // Accept camelCase or snake_case — app may send either
@@ -157,6 +167,10 @@ app.post('/api/auth/integrity-token', async (request, reply) => {
 // Returns: ssh connection details + private key
 // ─────────────────────────────────────────────
 app.post('/labs/provision', {
+  // Provisioning spins up a real container — 5/min/IP is plenty for a
+  // legitimate user (one session at a time, device-capped anyway) and
+  // blunts scripted mass-provisioning.
+  config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
   schema: {
     body: {
       type: 'object',
@@ -206,7 +220,7 @@ app.post('/labs/provision', {
   }
 
   try {
-    const result = await provisionContainer(uuid, deviceId)
+    const result = await provisionContainer(uuid, deviceId, request.ip)
     const host = process.env.HOST_IP || '127.0.0.1'
 
     return {
@@ -219,7 +233,8 @@ app.post('/labs/provision', {
       }
     }
   } catch (err) {
-    const statusCode = err.message.includes('Maximum concurrent') ? 503
+    const statusCode = err.message.includes('banned') ? 403
+      : err.message.includes('Maximum concurrent') ? 503
       : err.message.includes('already exists') ? 409
       : 500
 
@@ -516,6 +531,84 @@ app.post('/api/admin/pro-devices', async (request, reply) => {
   })
 })
 
+// ─────────────────────────────────────────────
+// GET  /api/admin/bans               — { deviceIds, ips }
+// POST /api/admin/bans               — { addDeviceId? } | { removeDeviceId? }
+//                                       | { addIp? } | { removeIp? }
+// Checked by provisionContainer before a session is created (both free and
+// pro — abuse-prevention is orthogonal to tier, see /api/labs/config's
+// tier split which is duration-only).
+// ─────────────────────────────────────────────
+app.get('/api/admin/bans', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return { success: true, data: { deviceIds: settings.bannedDeviceIds, ips: settings.bannedIps } }
+})
+
+app.post('/api/admin/bans', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const { addDeviceId, removeDeviceId, addIp, removeIp } = request.body || {}
+
+  if (addDeviceId !== undefined) {
+    if (typeof addDeviceId !== 'string' || !addDeviceId || addDeviceId.length > 128) {
+      return reply.code(400).send({ success: false, error: 'Invalid deviceId' })
+    }
+    if (!settings.bannedDeviceIds.includes(addDeviceId)) settings.bannedDeviceIds.push(addDeviceId)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.bannedDeviceIds, ips: settings.bannedIps } }
+  }
+
+  if (removeDeviceId !== undefined) {
+    settings.bannedDeviceIds = settings.bannedDeviceIds.filter(id => id !== removeDeviceId)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.bannedDeviceIds, ips: settings.bannedIps } }
+  }
+
+  if (addIp !== undefined) {
+    if (!isValidIp(addIp)) {
+      return reply.code(400).send({ success: false, error: 'Invalid IP address' })
+    }
+    if (!settings.bannedIps.includes(addIp)) settings.bannedIps.push(addIp)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.bannedDeviceIds, ips: settings.bannedIps } }
+  }
+
+  if (removeIp !== undefined) {
+    settings.bannedIps = settings.bannedIps.filter(ip => ip !== removeIp)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.bannedDeviceIds, ips: settings.bannedIps } }
+  }
+
+  return reply.code(400).send({
+    success: false,
+    error: 'Invalid request. Expected one of: addDeviceId, removeDeviceId, addIp, removeIp'
+  })
+})
+
+// ─────────────────────────────────────────────
+// GET /api/admin/activity        — recent provisioning events: ip, country,
+//                                   deviceId, uuid, tier, timestamp
+// GET /api/admin/suspicious      — deviceIds seen from more than one country
+//                                   (VPN/Tor-hopping signal)
+// GET /api/admin/firewall-status — live check that the outbound abuse-port
+//                                   DROP rules are actually in place
+// ─────────────────────────────────────────────
+app.get('/api/admin/activity', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const limit = Number(request.query.limit) || 200
+  return { success: true, data: { events: getRecentActivity(limit) } }
+})
+
+app.get('/api/admin/suspicious', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return { success: true, data: { devices: getSuspiciousDevices() } }
+})
+
+app.get('/api/admin/firewall-status', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const status = await getEgressFirewallStatus()
+  return { success: true, data: status }
+})
+
 app.get('/dashboard', async (request, reply) => {
   if (checkAdminKey(request, reply) === false) return
   const adminKey = process.env.ADMIN_KEY ? `?key=${process.env.ADMIN_KEY}` : ''
@@ -577,6 +670,21 @@ function getDashboardHtml (qs) {
   .ip-add-row button{background:#3730a3;color:#e0e7ff;border:1px solid #4338ca;border-radius:6px;padding:8px 14px;font-size:0.8rem;font-weight:600;cursor:pointer}
   .ip-add-row button:hover{background:#4338ca}
   .ip-empty{font-size:0.78rem;color:#64748b;margin-top:10px}
+  .fw-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;font-family:monospace;font-size:0.82rem}
+  .fw-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+  .fw-dot.ok{background:#22c55e}
+  .fw-dot.bad{background:#ef4444}
+  .fw-summary{font-size:0.85rem;font-weight:600;margin-bottom:8px}
+  .fw-summary.ok{color:#4ade80}
+  .fw-summary.bad{color:#fca5a5}
+  .two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:720px){.two-col{grid-template-columns:1fr}}
+  .activity-row{display:grid;grid-template-columns:70px 60px 1fr 50px 110px;gap:8px;padding:8px 0;font-family:monospace;font-size:0.78rem;border-bottom:1px solid #1a1d2e}
+  .activity-row.head{color:#94a3b8;font-size:0.68rem;text-transform:uppercase;border-bottom:1px solid #2d3148}
+  .pill{display:inline-block;padding:1px 6px;border-radius:4px;font-size:0.68rem;font-weight:700}
+  .pill.pro{background:#3730a3;color:#e0e7ff}
+  .pill.free{background:#334155;color:#cbd5e1}
+  .susp-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1a1d2e;font-size:0.82rem}
 </style>
 </head>
 <body>
@@ -599,9 +707,38 @@ function getDashboardHtml (qs) {
     </div>
   </div>
 </div>
+<div class="two-col">
+  <div class="settings-box">
+    <div class="section-title">Banned Device IDs</div>
+    <div id="ban-device-list" class="ip-list"></div>
+    <div class="ip-add-row">
+      <input type="text" id="ban-device-input" placeholder="deviceId" onkeydown="if(event.key==='Enter')addBanDevice()"/>
+      <button onclick="addBanDevice()">Ban</button>
+    </div>
+  </div>
+  <div class="settings-box">
+    <div class="section-title">Banned IPs</div>
+    <div id="ban-ip-list" class="ip-list"></div>
+    <div class="ip-add-row">
+      <input type="text" id="ban-ip-input" placeholder="e.g. 203.0.113.42" onkeydown="if(event.key==='Enter')addBanIp()"/>
+      <button onclick="addBanIp()">Ban</button>
+    </div>
+  </div>
+</div>
+<div class="settings-box">
+  <div class="section-title">Outbound Abuse-Port Firewall</div>
+  <div id="fw-summary" class="fw-summary">Loading…</div>
+  <div id="fw-rows"></div>
+</div>
+<div class="settings-box" id="suspicious-box" style="display:none">
+  <div class="section-title">Suspicious Devices (multiple countries seen)</div>
+  <div id="suspicious-list"></div>
+</div>
 <div class="cards" id="cards"></div>
 <div class="section-title">Active Containers</div>
 <div id="table-wrap"></div>
+<div class="section-title" style="margin-top:28px">Recent Provisioning Activity</div>
+<div class="settings-box" id="activity-wrap"></div>
 <script>
 const QS = '${qs}'
 function barClass(p){return p>80?'danger':p>60?'warn':''}
@@ -678,6 +815,104 @@ async function removeIp(ip){
   }catch(e){alert('Request failed')}
 }
 
+function renderBanList(el,items,removeFn){
+  if(!items||items.length===0){
+    el.innerHTML='<div class="ip-empty">None banned</div>'
+    return
+  }
+  el.innerHTML=items.map(v=>\`<span class="ip-chip">\${v}<button onclick="\${removeFn}('\${v}')" title="Remove">×</button></span>\`).join('')
+}
+
+async function loadBans(){
+  try{
+    const r=await fetch('/api/admin/bans'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    renderBanList(document.getElementById('ban-device-list'),j.data.deviceIds,'removeBanDevice')
+    renderBanList(document.getElementById('ban-ip-list'),j.data.ips,'removeBanIp')
+  }catch(e){}
+}
+
+async function postBan(body){
+  const r=await fetch('/api/admin/bans'+QS,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  const j=await r.json()
+  if(!j.success){alert('Error: '+j.error);return}
+  renderBanList(document.getElementById('ban-device-list'),j.data.deviceIds,'removeBanDevice')
+  renderBanList(document.getElementById('ban-ip-list'),j.data.ips,'removeBanIp')
+}
+
+function addBanDevice(){
+  const input=document.getElementById('ban-device-input')
+  const v=input.value.trim()
+  if(!v)return
+  input.value=''
+  postBan({addDeviceId:v})
+}
+function removeBanDevice(v){postBan({removeDeviceId:v})}
+
+function addBanIp(){
+  const input=document.getElementById('ban-ip-input')
+  const v=input.value.trim()
+  if(!v)return
+  input.value=''
+  postBan({addIp:v})
+}
+function removeBanIp(v){postBan({removeIp:v})}
+
+async function loadFirewallStatus(){
+  try{
+    const r=await fetch('/api/admin/firewall-status'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    const d=j.data
+    const summary=document.getElementById('fw-summary')
+    summary.textContent=d.allActive?'✓ All outbound abuse-port rules active':'✗ Some rules missing — check sudoers/iptables on host'
+    summary.className='fw-summary '+(d.allActive?'ok':'bad')
+    document.getElementById('fw-rows').innerHTML=d.ports.map(p=>
+      \`<div class="fw-row"><span><span class="fw-dot \${p.blocked?'ok':'bad'}"></span>port \${p.port}</span><span>\${p.blocked?'blocked':'NOT blocked'}</span></div>\`
+    ).join('')
+  }catch(e){
+    document.getElementById('fw-summary').textContent='Error checking firewall status'
+  }
+}
+
+async function loadActivity(){
+  try{
+    const r=await fetch('/api/admin/activity'+QS+(QS?'&':'?')+'limit=100')
+    const j=await r.json()
+    if(!j.success)return
+    const events=j.data.events
+    const head='<div class="activity-row head"><span>Time</span><span>Tier</span><span>Device</span><span>Country</span><span>IP</span></div>'
+    if(events.length===0){
+      document.getElementById('activity-wrap').innerHTML=head+'<div class="no-data">No activity yet</div>'
+      return
+    }
+    const rows=events.map(e=>\`<div class="activity-row">
+      <span>\${new Date(e.timestamp).toLocaleTimeString()}</span>
+      <span><span class="pill \${e.isPro?'pro':'free'}">\${e.isPro?'PRO':'FREE'}</span></span>
+      <span title="\${e.deviceId||''}">\${(e.deviceId||'—').slice(0,16)}</span>
+      <span>\${e.country||'—'}</span>
+      <span>\${e.ip||'—'}</span>
+    </div>\`).join('')
+    document.getElementById('activity-wrap').innerHTML=head+rows
+  }catch(e){}
+}
+
+async function loadSuspicious(){
+  try{
+    const r=await fetch('/api/admin/suspicious'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    const devices=j.data.devices
+    const box=document.getElementById('suspicious-box')
+    if(devices.length===0){box.style.display='none';return}
+    box.style.display='block'
+    document.getElementById('suspicious-list').innerHTML=devices.map(d=>
+      \`<div class="susp-row"><span title="\${d.deviceId}">\${d.deviceId.slice(0,20)}…</span><span>\${d.countries.join(', ')}</span></div>\`
+    ).join('')
+  }catch(e){}
+}
+
 async function destroy(fullId,btn){
   if(!confirm('Force destroy this container?'))return
   btn.disabled=true
@@ -695,6 +930,10 @@ async function load(){
     const sj=await sr.json()
     if(sj.success){updateSkipDebugUI(sj.data.skipDebugPackages)}
     loadIpList()
+    loadBans()
+    loadFirewallStatus()
+    loadActivity()
+    loadSuspicious()
 
     const r=await fetch('/api/admin/stats'+QS)
     const j=await r.json()

@@ -7,6 +7,8 @@ const path = require('path')
 const fs = require('fs')
 const os = require('os')
 const { settings } = require('./settings')
+const { logProvision } = require('./activity')
+const { ensureEgressBlockRules } = require('./firewall-egress')
 
 // Podman (not Docker) runs the lab containers. Reason: labs run full systemd
 // as PID 1 (so labuser gets a real serviceable VPS, not just a bare shell),
@@ -231,9 +233,16 @@ async function createContainer(uuid, publicKey, sshPort) {
   }
 }
 
-async function provisionContainer(uuid, deviceId) {
+async function provisionContainer(uuid, deviceId, ip) {
   if (sessions.has(uuid)) {
     throw new Error('UUID already exists')
+  }
+
+  if (deviceId && settings.bannedDeviceIds.includes(deviceId)) {
+    throw new Error('This device is banned')
+  }
+  if (ip && settings.bannedIps.includes(ip)) {
+    throw new Error('This IP is banned')
   }
 
   if (deviceId) {
@@ -299,6 +308,8 @@ async function provisionContainer(uuid, deviceId) {
 
   const timer = setTimeout(() => destroyContainer(uuid, true), durationMs)
   session.timer = timer
+
+  logProvision({ uuid, deviceId, ip, isPro })
 
   return {
     uuid,
@@ -496,7 +507,9 @@ function isUuidConflict(uuid) {
 // between removing the container and closing its port) would otherwise sit
 // open on the internet indefinitely with nothing to notice it.
 reconcileFirewallRules()
+ensureEgressBlockRules()
 setInterval(reconcileFirewallRules, FIREWALL_RECONCILE_INTERVAL_MS)
+setInterval(ensureEgressBlockRules, FIREWALL_RECONCILE_INTERVAL_MS)
 
 module.exports = {
   provisionContainer,

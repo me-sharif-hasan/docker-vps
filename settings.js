@@ -13,6 +13,8 @@ function loadSettings () {
     const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
     if (!Array.isArray(loaded.debugWhitelistIps)) loaded.debugWhitelistIps = []
     if (!Array.isArray(loaded.proDeviceIds)) loaded.proDeviceIds = []
+    if (!Array.isArray(loaded.bannedDeviceIds)) loaded.bannedDeviceIds = []
+    if (!Array.isArray(loaded.bannedIps)) loaded.bannedIps = []
     if (typeof loaded.freeSessionMinutes !== 'number') loaded.freeSessionMinutes = 30
     if (typeof loaded.proSessionMinutes !== 'number') loaded.proSessionMinutes = 120
     return loaded
@@ -21,6 +23,8 @@ function loadSettings () {
       skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false,
       debugWhitelistIps: [],
       proDeviceIds: [],
+      bannedDeviceIds: [],
+      bannedIps: [],
       freeSessionMinutes: 30,
       proSessionMinutes: 120
     }

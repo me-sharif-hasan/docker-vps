@@ -5,3 +5,4 @@ node_modules/
 service-account.json
 serviceaccount-new.json
 settings.json
+activity.log
