@@ -317,12 +317,17 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
     clearTimeout(session.timer)
   }
 
-  await podman(['rm', '-f', session.containerId]).catch(() => {})
-  await closeFirewallPort(session.sshPort)
-
+  // Drop all bookkeeping FIRST, synchronously, before the slow teardown
+  // below (podman rm, firewall close — real wall-clock time). Otherwise a
+  // provision() racing in on the same deviceId reads sessions/deviceSessions
+  // while this container is still "alive" in the map but already mid-
+  // teardown (or already gone), and hands back a dead session.
   usedPorts.delete(session.sshPort)
   sessions.delete(uuid)
   if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
+
+  await podman(['rm', '-f', session.containerId]).catch(() => {})
+  await closeFirewallPort(session.sshPort)
 
   return { uuid, destroyed: true, reason: isAutoExpiry ? 'expired' : 'manual' }
 }
@@ -461,16 +466,17 @@ async function forceDestroyContainer(containerId) {
     } catch { /* container may already be gone */ }
   }
 
-  await podman(['rm', '-f', containerId])
-  if (sshPort) await closeFirewallPort(sshPort)
-
-  // Clean up session if tracked
+  // Clean up bookkeeping before the slow teardown below — see
+  // destroyContainer's comment on why the order matters.
   if (session) {
     if (session.timer) clearTimeout(session.timer)
     usedPorts.delete(session.sshPort)
     sessions.delete(uuid)
     if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
   }
+
+  await podman(['rm', '-f', containerId])
+  if (sshPort) await closeFirewallPort(sshPort)
 
   return { destroyed: true, containerId, containerName: name }
 }
