@@ -22,6 +22,25 @@ const IMAGE_NAME = 'serverkit-lab'
 const MAX_CONCURRENT = 10
 const SESSION_DURATION_MS = 30 * 60 * 1000 // 30 minutes
 
+// Podman runs as this dedicated Linux user, not the app's own (iishanto/
+// ubuntu, whichever is deploying). Two independent reasons:
+//  1. Egress routing: the host has a WireGuard tunnel to an exit node, with
+//     an `ip rule uidrange <runner-uid> table 200` policy route sending only
+//     this user's traffic through it. pasta (podman's rootless network
+//     backend) inherits whatever uid invoked podman for its own host-side
+//     relay sockets — giving it a uid distinct from the app's own process
+//     is what makes "only lab containers' egress is tunneled" possible
+//     without touching the host's own default route or any pasta network
+//     flags (both were tried first; pasta's --outbound-if4/-o flags turned
+//     out to corrupt the guest's own address/routing setup under real
+//     systemd+port-mapping containers, and changing the host's own default
+//     route risked breaking the app's/CI's own outbound traffic).
+//  2. Blast radius: a container breakout now lands as this low-value
+//     dedicated user — whose home holds nothing but podman's own image
+//     storage — instead of the account that owns the app, its secrets,
+//     and the CI deploy key.
+const RUNNER_USER = 'labrunner'
+
 const MB = 1024 * 1024
 const CONTAINER_MEMORY_LIMIT = 200 * MB      // 200MB RAM hard limit
 const CONTAINER_MEMORY_SWAP  = 300 * MB      // 100MB swap headroom
@@ -40,7 +59,11 @@ const sessions = new Map()
 const usedPorts = new Set()
 
 function podman(args) {
-  return execFileAsync('podman', args, { maxBuffer: 10 * MB })
+  // `sudo -i -u` (not plain `-u`) — without `-i` the child keeps the caller's
+  // own cwd/HOME, which labrunner can't reach (the app's home dir is 0750,
+  // not in labrunner's group); `-i` gives it a real login environment
+  // (HOME, cwd, XDG_RUNTIME_DIR) under its own identity.
+  return execFileAsync('sudo', ['-i', '-u', RUNNER_USER, 'podman', ...args], { maxBuffer: 10 * MB })
 }
 
 // Lab SSH ports (32000-33000) aren't open by default — ufw denies incoming
@@ -131,7 +154,15 @@ async function buildImageIfNeeded() {
     return // already exists
   } catch {
     const dockerfilePath = path.join(__dirname, 'docker')
-    await podman(['build', '-t', IMAGE_NAME, dockerfilePath])
+    // labrunner (see RUNNER_USER above) can't read this path directly — the
+    // app's home directory is 0750 and labrunner isn't in its group, so
+    // traversal into it is blocked regardless of the docker/ dir's own
+    // permissions. Stage a copy somewhere labrunner owns before building.
+    const stagedContext = '/tmp/serverkit-lab-build'
+    await execFileAsync('sudo', ['rm', '-rf', stagedContext])
+    await execFileAsync('sudo', ['cp', '-r', dockerfilePath, stagedContext])
+    await execFileAsync('sudo', ['chown', '-R', `${RUNNER_USER}:${RUNNER_USER}`, stagedContext])
+    await podman(['build', '-t', IMAGE_NAME, stagedContext])
   }
 }
 
