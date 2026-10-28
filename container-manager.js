@@ -6,6 +6,7 @@ const execFileAsync = promisify(execFile)
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
+const net = require('net')
 const { settings } = require('./settings')
 const { logProvision } = require('./activity')
 const { ensureEgressBlockRules } = require('./firewall-egress')
@@ -178,6 +179,35 @@ async function closeFirewallPort(port) {
   // Must match openFirewallPort's rule spec exactly — ufw's `delete` deletes
   // by matching the full rule, not just the port.
   await execFileAsync('sudo', ['ufw', '--force', 'delete', 'allow', 'from', ORACLE_BASTION_IP, 'to', 'any', 'port', String(port), 'proto', 'tcp']).catch(() => {})
+}
+
+const SSH_READY_TIMEOUT_MS = 8000
+const SSH_READY_POLL_INTERVAL_MS = 150
+
+// Polls the published port over loopback (the actual bind podman set up,
+// not a podman-exec check inside the container) until sshd accepts a raw
+// TCP connection, or the timeout elapses. Never throws - if sshd genuinely
+// never comes up in time, provisionContainer still returns its result
+// rather than failing the whole request over a readiness check.
+function waitForSshReady(port, timeoutMs = SSH_READY_TIMEOUT_MS) {
+  return new Promise(resolve => {
+    const deadline = Date.now() + timeoutMs
+
+    function attempt() {
+      const socket = net.createConnection({ port, host: '127.0.0.1' })
+      const finish = ready => {
+        socket.removeAllListeners()
+        socket.destroy()
+        if (ready || Date.now() >= deadline) return resolve()
+        setTimeout(attempt, SSH_READY_POLL_INTERVAL_MS)
+      }
+      socket.once('connect', () => finish(true))
+      socket.once('error', () => finish(false))
+      socket.setTimeout(500, () => finish(false))
+    }
+
+    attempt()
+  })
 }
 
 // On startup, sessions are empty (in-memory, wiped by every restart/deploy)
@@ -353,6 +383,12 @@ async function provisionContainer(uuid, deviceId, ip) {
     containerId = await createContainer(uuid, publicKey, sshPort)
     await assignDiskQuota(containerId, projectId)
     await openFirewallPort(uuid, sshPort)
+    // The container is "running" the instant podman returns, but systemd
+    // (dbus, journald, etc.) takes a bit to actually bring sshd up - a
+    // client that connects the moment provision() responds can hit a
+    // refused/reset connection. Hold the response until sshd is actually
+    // accepting, so "fresh provision -> instant Open Dashboard" just works.
+    await waitForSshReady(sshPort)
   } catch (err) {
     usedPorts.delete(sshPort)
     usedProjectIds.delete(projectId)
