@@ -53,11 +53,45 @@ const CONTAINER_MEMORY_LIMIT = 200 * MB      // 200MB RAM hard limit
 const CONTAINER_MEMORY_SWAP  = 300 * MB      // 100MB swap headroom
 const CONTAINER_CPU_QUOTA    = 50000         // 50% of one core (100000 = 1 core)
 const CONTAINER_CPU_PERIOD   = 100000
-const CONTAINER_DISK_LIMIT   = '2g'          // requires overlay2 + quota support
+const CONTAINER_DISK_LIMIT   = '2g'          // enforced via XFS project quota, see assignDiskQuota
 const CONTAINER_PIDS_LIMIT   = 512           // cap total process/thread count
 const PORT_RANGE_START = 32000
 const PORT_RANGE_END = 33000
 const FIREWALL_RECONCILE_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
+
+// Podman's own --storage-opt size= (which this originally tried to use)
+// needs to mknod a backing-device node to verify project-quota support -
+// mknod requires a real root capability that labrunner's rootless uid
+// doesn't have, so it always failed and silently fell back to no limit at
+// all (confirmed live: a lab could write to the host's full free disk).
+// Fix: a dedicated XFS-formatted loop image, mounted at this path with
+// -o pquota, holds labrunner's whole podman graphroot (set in
+// ~labrunner/.config/containers/storage.conf) instead of the host's own
+// ext4 root (which has no project-quota feature at all). Assigning the
+// quota itself is then done directly via xfs_quota as true root — sudo
+// here is the app's own account (not `sudo -i -u labrunner`), since only
+// real root can set an XFS project id/limit, sidestepping the mknod check
+// entirely rather than needing labrunner to have it.
+const LAB_STORAGE_MOUNT = '/mnt/lab-storage'
+const PROJECT_ID_BASE = 5000
+const usedProjectIds = new Set()
+
+function nextProjectId() {
+  for (let id = PROJECT_ID_BASE; id < PROJECT_ID_BASE + MAX_CONCURRENT * 2; id++) {
+    if (!usedProjectIds.has(id)) {
+      usedProjectIds.add(id)
+      return id
+    }
+  }
+  throw new Error('No available disk-quota project ids')
+}
+
+async function assignDiskQuota(containerId, projectId) {
+  const { stdout } = await podman(['inspect', containerId, '--format', '{{.GraphDriver.Data.UpperDir}}'])
+  const upperDir = stdout.trim()
+  await execFileAsync('sudo', ['xfs_quota', '-x', '-c', `project -s -p ${upperDir} ${projectId}`, LAB_STORAGE_MOUNT])
+  await execFileAsync('sudo', ['xfs_quota', '-x', '-c', `limit -p bhard=${CONTAINER_DISK_LIMIT} ${projectId}`, LAB_STORAGE_MOUNT])
+}
 
 // Without these, `free`, `cat /proc/meminfo`, `nproc`, `lscpu` inside a
 // container read the HOST's real numbers — /proc isn't cgroup-aware on its
@@ -253,23 +287,11 @@ async function createContainer(uuid, publicKey, sshPort) {
     '--tmpfs', '/run:rw,noexec,nosuid,size=65536k',
     '--tmpfs', '/run/lock:rw,noexec,nosuid,size=65536k',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m',
-    '--storage-opt', `size=${CONTAINER_DISK_LIMIT}`,
     IMAGE_NAME
   ]
 
-  try {
-    const { stdout } = await podman(args)
-    return stdout.trim()
-  } catch (err) {
-    if (err.message && err.message.includes('storage')) {
-      // storage-opt size not supported by this storage driver — retry without it
-      const idx = args.indexOf('--storage-opt')
-      const fallback = [...args.slice(0, idx), ...args.slice(idx + 2)]
-      const { stdout } = await podman(fallback)
-      return stdout.trim()
-    }
-    throw err
-  }
+  const { stdout } = await podman(args)
+  return stdout.trim()
 }
 
 async function provisionContainer(uuid, deviceId, ip) {
@@ -314,12 +336,15 @@ async function provisionContainer(uuid, deviceId, ip) {
   const sshPort = getRandomPort()
   usedPorts.add(sshPort)
 
+  const projectId = nextProjectId()
   let containerId
   try {
     containerId = await createContainer(uuid, publicKey, sshPort)
+    await assignDiskQuota(containerId, projectId)
     await openFirewallPort(uuid, sshPort)
   } catch (err) {
     usedPorts.delete(sshPort)
+    usedProjectIds.delete(projectId)
     if (containerId) await podman(['rm', '-f', containerId]).catch(() => {})
     throw err
   }
@@ -334,6 +359,7 @@ async function provisionContainer(uuid, deviceId, ip) {
     uuid,
     containerId,
     sshPort,
+    projectId,
     privateKey,
     publicKey,
     createdAt: Date.now(),
@@ -387,6 +413,7 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
   // while this container is still "alive" in the map but already mid-
   // teardown (or already gone), and hands back a dead session.
   usedPorts.delete(session.sshPort)
+  usedProjectIds.delete(session.projectId)
   sessions.delete(uuid)
   if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
 
@@ -589,6 +616,7 @@ async function forceDestroyContainer(containerId) {
   if (session) {
     if (session.timer) clearTimeout(session.timer)
     usedPorts.delete(session.sshPort)
+    usedProjectIds.delete(session.projectId)
     sessions.delete(uuid)
     if (session.deviceId && deviceSessions.get(session.deviceId) === uuid) deviceSessions.delete(session.deviceId)
   }
