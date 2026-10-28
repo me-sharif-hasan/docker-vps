@@ -13,6 +13,15 @@ const execFileAsync = promisify(execFile)
 // chain, so it cannot undo these rules.
 const RUNNER_USER = 'labrunner'
 
+// This host has both nft and legacy iptables backends; the bare `iptables`
+// command resolves (via update-alternatives) to the nft-compat one, which
+// is NOT where ufw or real traffic actually lands (verified: its OUTPUT
+// chain saw 3 packets total vs iptables-legacy's 300k+) - rules added
+// through plain `iptables` are therefore silently inert. Target the legacy
+// binary explicitly so these rules land in the chain traffic really flows
+// through.
+const IPTABLES_BIN = 'iptables-legacy'
+
 // 25/465/587: direct SMTP — the #1 throwaway-VM spam vector.
 // 6667/6697: IRC — legacy botnet C2.
 // 445/139: SMB — internal network scanning/worm spread.
@@ -27,7 +36,7 @@ function ruleArgs (port) {
 
 async function ruleExists (port) {
   try {
-    await execFileAsync('sudo', ['iptables', '-C', ...ruleArgs(port)])
+    await execFileAsync('sudo', [IPTABLES_BIN, '-C', ...ruleArgs(port)])
     return true
   } catch {
     return false
@@ -40,7 +49,7 @@ async function ensureEgressBlockRules () {
   for (const port of ABUSE_PORTS) {
     try {
       if (!(await ruleExists(port))) {
-        await execFileAsync('sudo', ['iptables', '-A', ...ruleArgs(port)])
+        await execFileAsync('sudo', [IPTABLES_BIN, '-A', ...ruleArgs(port)])
       }
     } catch (err) {
       console.error(`Egress block rule failed for port ${port}:`, err.message)
