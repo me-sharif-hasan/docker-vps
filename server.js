@@ -685,6 +685,10 @@ function getDashboardHtml (qs) {
   .pill.pro{background:#3730a3;color:#e0e7ff}
   .pill.free{background:#334155;color:#cbd5e1}
   .susp-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1a1d2e;font-size:0.82rem}
+  .duration-edit{display:flex;gap:8px;align-items:center}
+  .duration-edit input{background:#0f1117;border:1px solid #2d3148;border-radius:6px;padding:6px 8px;color:#e2e8f0;font-family:monospace;font-size:0.85rem}
+  .duration-edit button{background:#3730a3;color:#e0e7ff;border:1px solid #4338ca;border-radius:6px;padding:6px 12px;font-size:0.8rem;font-weight:600;cursor:pointer}
+  .duration-edit button:hover{background:#4338ca}
 </style>
 </head>
 <body>
@@ -706,6 +710,24 @@ function getDashboardHtml (qs) {
       <button onclick="addIp()">Add</button>
     </div>
   </div>
+</div>
+<div class="settings-box">
+  <div class="section-title">Session Durations (minutes)</div>
+  <div class="setting-item">
+    <span class="setting-label">Free tier</span>
+    <div class="duration-edit">
+      <input type="number" id="free-minutes-input" min="1" style="width:80px"/>
+      <button onclick="saveSessionLimits()">Save</button>
+    </div>
+  </div>
+  <div class="setting-item">
+    <span class="setting-label">Pro tier</span>
+    <div class="duration-edit">
+      <input type="number" id="pro-minutes-input" min="1" style="width:80px"/>
+      <button onclick="saveSessionLimits()">Save</button>
+    </div>
+  </div>
+  <div id="session-limits-msg" class="ip-empty"></div>
 </div>
 <div class="two-col">
   <div class="settings-box">
@@ -913,6 +935,46 @@ async function loadSuspicious(){
   }catch(e){}
 }
 
+async function loadSessionLimits(){
+  try{
+    const r=await fetch('/api/admin/session-limits'+QS)
+    const j=await r.json()
+    if(!j.success)return
+    // Don't clobber while the admin is mid-edit on an auto-refresh tick.
+    const freeEl=document.getElementById('free-minutes-input')
+    const proEl=document.getElementById('pro-minutes-input')
+    if(document.activeElement!==freeEl) freeEl.value=j.data.freeSessionMinutes
+    if(document.activeElement!==proEl) proEl.value=j.data.proSessionMinutes
+  }catch(e){}
+}
+
+async function saveSessionLimits(){
+  const freeSessionMinutes=Number(document.getElementById('free-minutes-input').value)
+  const proSessionMinutes=Number(document.getElementById('pro-minutes-input').value)
+  const msg=document.getElementById('session-limits-msg')
+  if(!freeSessionMinutes||freeSessionMinutes<=0||!proSessionMinutes||proSessionMinutes<=0){
+    msg.textContent='Both durations must be positive numbers.'
+    return
+  }
+  try{
+    const r=await fetch('/api/admin/session-limits'+QS,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({freeSessionMinutes,proSessionMinutes})
+    })
+    const j=await r.json()
+    if(j.success){
+      msg.textContent='Saved. Applies to sessions created from now on.'
+      document.getElementById('free-minutes-input').value=j.data.freeSessionMinutes
+      document.getElementById('pro-minutes-input').value=j.data.proSessionMinutes
+    }else{
+      msg.textContent='Error: '+j.error
+    }
+  }catch(e){
+    msg.textContent='Request failed'
+  }
+}
+
 async function destroy(fullId,btn){
   if(!confirm('Force destroy this container?'))return
   btn.disabled=true
@@ -930,6 +992,7 @@ async function load(){
     const sj=await sr.json()
     if(sj.success){updateSkipDebugUI(sj.data.skipDebugPackages)}
     loadIpList()
+    loadSessionLimits()
     loadBans()
     loadFirewallStatus()
     loadActivity()
