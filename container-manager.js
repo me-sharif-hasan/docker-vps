@@ -59,6 +59,29 @@ const PORT_RANGE_START = 32000
 const PORT_RANGE_END = 33000
 const FIREWALL_RECONCILE_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
+// Without these, `free`, `cat /proc/meminfo`, `nproc`, `lscpu` inside a
+// container read the HOST's real numbers — /proc isn't cgroup-aware on its
+// own, it's one shared kernel view. lxcfs (installed + running as a host
+// service, mounting FUSE-backed virtual files at this path) computes these
+// per the calling process's own cgroup limits instead. Bind-mounting them
+// over the container's own /proc entries is what actually makes `free -h`
+// inside a lab show its real 200MB limit instead of the host's full RAM.
+const LXCFS_PROC_DIR = '/var/lib/lxcfs/proc'
+const LXCFS_FILES = ['cpuinfo', 'meminfo', 'stat', 'diskstats', 'swaps', 'uptime', 'loadavg']
+
+// lxcfs's virtual cpuinfo lists the right core COUNT for the cgroup's cpu
+// quota, but `nproc` reads sched_getaffinity, not /proc/cpuinfo — it still
+// needs an actual cpuset restriction to report anything other than the
+// host's full core count. Round-robin one real core per container (rather
+// than pinning everyone to core 0) so concurrent sessions spread across
+// the host's cores instead of contending for one.
+let cpusetRotation = 0
+function nextCpusetCpu() {
+  const cpu = cpusetRotation % os.cpus().length
+  cpusetRotation++
+  return cpu
+}
+
 // In-memory store: uuid -> session info
 const sessions = new Map()
 
@@ -193,6 +216,11 @@ async function buildImageIfNeeded() {
 }
 
 async function createContainer(uuid, publicKey, sshPort) {
+  const cpusetCpu = nextCpusetCpu()
+  const lxcfsMounts = LXCFS_FILES.flatMap(f => [
+    '--mount', `type=bind,source=${LXCFS_PROC_DIR}/${f},destination=/proc/${f},ro=true`
+  ])
+
   const args = [
     'run', '-d',
     '--name', `lab-${uuid}`,
@@ -203,6 +231,8 @@ async function createContainer(uuid, publicKey, sshPort) {
     '--memory', String(CONTAINER_MEMORY_LIMIT),
     '--memory-swap', String(CONTAINER_MEMORY_SWAP),
     '--cpus', String(CONTAINER_CPU_QUOTA / CONTAINER_CPU_PERIOD),
+    '--cpuset-cpus', String(cpusetCpu),
+    ...lxcfsMounts,
     // Without this, a fork bomb inside the container exhausts the host's
     // shared PID table — memory/cpu limits don't stop it, only pids-limit
     // does. 512 covers systemd + sshd + a normal interactive session with
