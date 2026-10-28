@@ -15,15 +15,25 @@ const {
 } = require('./container-manager')
 const { isValidUuid } = require('./validate')
 const { verifyIntegrityToken, signLabsJwt, verifyLabsJwt } = require('./auth')
+const net = require('net')
+
+function isValidIp (str) {
+  return typeof str === 'string' && net.isIP(str) !== 0
+}
 
 // Settings — persisted to settings.json, survives restarts
 const SETTINGS_FILE = path.join(__dirname, 'settings.json')
 
 function loadSettings () {
   try {
-    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+    const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+    if (!Array.isArray(loaded.debugWhitelistIps)) loaded.debugWhitelistIps = []
+    return loaded
   } catch {
-    return { skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false }
+    return {
+      skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false,
+      debugWhitelistIps: []
+    }
   }
 }
 
@@ -46,9 +56,21 @@ app.register(cors, { origin: true })
 
 // ─────────────────────────────────────────────
 // JWT bearer guard on all /labs/* routes
+//
+// IMPORTANT: this checks request.routeOptions.url (the matched route
+// PATTERN, resolved by Fastify's router after it already decoded the path)
+// rather than request.url (the raw, still-percent-encoded path string).
+// A prefix check against the raw url (`request.url.startsWith('/labs/')`)
+// is bypassable: a path like /%6cabs/provision does not start with
+// "/labs/" as a raw string, so the old check let it through, but Fastify's
+// router still decodes and dispatches it to the /labs/provision handler
+// unauthenticated. Matching on the resolved route closes that gap because
+// it reflects what actually got dispatched, not the attacker-controlled
+// raw string.
 // ─────────────────────────────────────────────
 app.addHook('onRequest', async (request, reply) => {
-  if (!request.url.startsWith('/labs/') && request.url !== '/labs/stats') return
+  const routeUrl = request.routeOptions && request.routeOptions.url
+  if (!routeUrl || !routeUrl.startsWith('/labs')) return
 
   const authHeader = request.headers.authorization
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -82,8 +104,17 @@ app.post('/api/auth/integrity-token', async (request, reply) => {
     })
   }
 
-  // Skip Play Integrity for debug builds when setting is enabled
-  if (settings.skipDebugPackages && packageName.endsWith('.debug')) {
+  // Skip Play Integrity for debug builds when the setting is enabled AND
+  // the caller's IP is on the whitelist. The bypass is deliberately kept
+  // (it's needed for local/dev testing) but it must not be reachable from
+  // the open internet — an unlisted IP falls through to the real Play
+  // Integrity check below like any other caller.
+  const callerIp = request.ip
+  if (
+    settings.skipDebugPackages &&
+    packageName.endsWith('.debug') &&
+    settings.debugWhitelistIps.includes(callerIp)
+  ) {
     const token = signLabsJwt({ packageName, debug: true })
     return { success: true, token, expiresIn: 3600 }
   }
@@ -351,6 +382,40 @@ app.post('/api/admin/settings', async (request, reply) => {
   })
 })
 
+// ─────────────────────────────────────────────
+// GET  /api/admin/debug-whitelist        — list whitelisted IPs
+// POST /api/admin/debug-whitelist        — { add: ip } or { remove: ip }
+// ─────────────────────────────────────────────
+app.get('/api/admin/debug-whitelist', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return { success: true, data: { ips: settings.debugWhitelistIps } }
+})
+
+app.post('/api/admin/debug-whitelist', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const { add, remove } = request.body || {}
+
+  if (add !== undefined) {
+    if (!isValidIp(add)) {
+      return reply.code(400).send({ success: false, error: 'Invalid IP address' })
+    }
+    if (!settings.debugWhitelistIps.includes(add)) settings.debugWhitelistIps.push(add)
+    saveSettings()
+    return { success: true, data: { ips: settings.debugWhitelistIps } }
+  }
+
+  if (remove !== undefined) {
+    settings.debugWhitelistIps = settings.debugWhitelistIps.filter(ip => ip !== remove)
+    saveSettings()
+    return { success: true, data: { ips: settings.debugWhitelistIps } }
+  }
+
+  return reply.code(400).send({
+    success: false,
+    error: 'Invalid request. Expected: { add: ip } or { remove: ip }'
+  })
+})
+
 app.get('/dashboard', async (request, reply) => {
   if (checkAdminKey(request, reply) === false) return
   const adminKey = process.env.ADMIN_KEY ? `?key=${process.env.ADMIN_KEY}` : ''
@@ -403,6 +468,15 @@ function getDashboardHtml (qs) {
   .toggle-switch.active{background:#22c55e}
   .toggle-switch .slider{position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;transition:left 0.2s}
   .toggle-switch.active .slider{left:22px}
+  .ip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .ip-chip{display:flex;align-items:center;gap:6px;background:#252840;border:1px solid #2d3148;border-radius:6px;padding:4px 6px 4px 10px;font-family:monospace;font-size:0.8rem}
+  .ip-chip button{background:none;border:none;color:#64748b;cursor:pointer;font-size:0.9rem;line-height:1;padding:2px 4px}
+  .ip-chip button:hover{color:#ef4444}
+  .ip-add-row{display:flex;gap:8px;margin-top:10px}
+  .ip-add-row input{flex:1;background:#0f1117;border:1px solid #2d3148;border-radius:6px;padding:8px 10px;color:#e2e8f0;font-family:monospace;font-size:0.85rem}
+  .ip-add-row button{background:#3730a3;color:#e0e7ff;border:1px solid #4338ca;border-radius:6px;padding:8px 14px;font-size:0.8rem;font-weight:600;cursor:pointer}
+  .ip-add-row button:hover{background:#4338ca}
+  .ip-empty{font-size:0.78rem;color:#64748b;margin-top:10px}
 </style>
 </head>
 <body>
@@ -414,6 +488,14 @@ function getDashboardHtml (qs) {
     <span class="setting-label">Skip Debug Packages (.debug)</span>
     <div class="toggle-switch" id="skip-debug-toggle" onclick="toggleSkipDebug()">
       <div class="slider"></div>
+    </div>
+  </div>
+  <div class="setting-item" style="display:block">
+    <span class="setting-label">Debug Bypass IP Whitelist</span>
+    <div id="ip-list" class="ip-list"></div>
+    <div class="ip-add-row">
+      <input type="text" id="ip-input" placeholder="e.g. 203.0.113.42" onkeydown="if(event.key==='Enter')addIp()"/>
+      <button onclick="addIp()">Add</button>
     </div>
   </div>
 </div>
@@ -452,6 +534,50 @@ function updateSkipDebugUI(enabled){
   }
 }
 
+function renderIpList(ips){
+  const el=document.getElementById('ip-list')
+  if(!ips||ips.length===0){
+    el.innerHTML='<div class="ip-empty">No IPs whitelisted — the .debug bypass is unreachable from anywhere.</div>'
+    return
+  }
+  el.innerHTML=ips.map(ip=>\`<span class="ip-chip">\${ip}<button onclick="removeIp('\${ip}')" title="Remove">×</button></span>\`).join('')
+}
+
+async function loadIpList(){
+  try{
+    const r=await fetch('/api/admin/debug-whitelist'+QS)
+    const j=await r.json()
+    if(j.success)renderIpList(j.data.ips)
+  }catch(e){}
+}
+
+async function addIp(){
+  const input=document.getElementById('ip-input')
+  const ip=input.value.trim()
+  if(!ip)return
+  try{
+    const r=await fetch('/api/admin/debug-whitelist'+QS,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({add:ip})
+    })
+    const j=await r.json()
+    if(j.success){input.value='';renderIpList(j.data.ips)}else{alert('Error: '+j.error)}
+  }catch(e){alert('Request failed')}
+}
+
+async function removeIp(ip){
+  try{
+    const r=await fetch('/api/admin/debug-whitelist'+QS,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({remove:ip})
+    })
+    const j=await r.json()
+    if(j.success)renderIpList(j.data.ips)
+  }catch(e){alert('Request failed')}
+}
+
 async function destroy(fullId,btn){
   if(!confirm('Force destroy this container?'))return
   btn.disabled=true
@@ -468,6 +594,7 @@ async function load(){
     const sr=await fetch('/api/admin/settings'+QS)
     const sj=await sr.json()
     if(sj.success){updateSkipDebugUI(sj.data.skipDebugPackages)}
+    loadIpList()
 
     const r=await fetch('/api/admin/stats'+QS)
     const j=await r.json()

@@ -28,8 +28,10 @@ const CONTAINER_MEMORY_SWAP  = 300 * MB      // 100MB swap headroom
 const CONTAINER_CPU_QUOTA    = 50000         // 50% of one core (100000 = 1 core)
 const CONTAINER_CPU_PERIOD   = 100000
 const CONTAINER_DISK_LIMIT   = '2g'          // requires overlay2 + quota support
+const CONTAINER_PIDS_LIMIT   = 512           // cap total process/thread count
 const PORT_RANGE_START = 32000
 const PORT_RANGE_END = 33000
+const FIREWALL_RECONCILE_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 
 // In-memory store: uuid -> session info
 const sessions = new Map()
@@ -144,6 +146,11 @@ async function createContainer(uuid, publicKey, sshPort) {
     '--memory', String(CONTAINER_MEMORY_LIMIT),
     '--memory-swap', String(CONTAINER_MEMORY_SWAP),
     '--cpus', String(CONTAINER_CPU_QUOTA / CONTAINER_CPU_PERIOD),
+    // Without this, a fork bomb inside the container exhausts the host's
+    // shared PID table — memory/cpu limits don't stop it, only pids-limit
+    // does. 512 covers systemd + sshd + a normal interactive session with
+    // headroom, while still bounding a runaway fork loop.
+    '--pids-limit', String(CONTAINER_PIDS_LIMIT),
     // NET_ADMIN/NET_RAW let labuser run ufw/iptables inside their own lab.
     // Safe to grant: podman gives each container its own private network
     // namespace (pasta backend), so this only lets them manage their own
@@ -398,7 +405,14 @@ function isUuidConflict(uuid) {
   return sessions.has(uuid)
 }
 
+// Run once at startup (handles state left over from a crash/restart), then
+// keep re-reconciling periodically. A one-time run only catches drift that
+// existed at process start — a stray ufw rule left behind later (e.g. by a
+// raw `podman rm -f` outside the app, or any cleanup path that errors
+// between removing the container and closing its port) would otherwise sit
+// open on the internet indefinitely with nothing to notice it.
 reconcileFirewallRules()
+setInterval(reconcileFirewallRules, FIREWALL_RECONCILE_INTERVAL_MS)
 
 module.exports = {
   provisionContainer,
