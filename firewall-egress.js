@@ -18,9 +18,12 @@ const RUNNER_USER = 'labrunner'
 // is NOT where ufw or real traffic actually lands (verified: its OUTPUT
 // chain saw 3 packets total vs iptables-legacy's 300k+) - rules added
 // through plain `iptables` are therefore silently inert. Target the legacy
-// binary explicitly so these rules land in the chain traffic really flows
-// through.
-const IPTABLES_BIN = 'iptables-legacy'
+// binaries explicitly so these rules land in the chains traffic really
+// flows through — both of them: a live test (holding an SMTP connection
+// open and checking `ss -tnp` on the host) showed pasta relaying it over
+// IPv6 (smtp.gmail.com resolves dual-stack and this host prefers v6),
+// which an IPv4-only rule never sees at all.
+const IPTABLES_BINS = ['iptables-legacy', 'ip6tables-legacy']
 
 // 25/465/587: direct SMTP — the #1 throwaway-VM spam vector.
 // 6667/6697: IRC — legacy botnet C2.
@@ -34,9 +37,9 @@ function ruleArgs (port) {
   return ['OUTPUT', '-m', 'owner', '--uid-owner', RUNNER_USER, '-p', 'tcp', '--dport', String(port), '-j', 'DROP']
 }
 
-async function ruleExists (port) {
+async function ruleExists (bin, port) {
   try {
-    await execFileAsync('sudo', [IPTABLES_BIN, '-C', ...ruleArgs(port)])
+    await execFileAsync('sudo', [bin, '-C', ...ruleArgs(port)])
     return true
   } catch {
     return false
@@ -46,24 +49,30 @@ async function ruleExists (port) {
 // Idempotent: safe to call on every startup/reconcile tick without piling
 // up duplicate rules.
 async function ensureEgressBlockRules () {
-  for (const port of ABUSE_PORTS) {
-    try {
-      if (!(await ruleExists(port))) {
-        await execFileAsync('sudo', [IPTABLES_BIN, '-A', ...ruleArgs(port)])
+  for (const bin of IPTABLES_BINS) {
+    for (const port of ABUSE_PORTS) {
+      try {
+        if (!(await ruleExists(bin, port))) {
+          await execFileAsync('sudo', [bin, '-A', ...ruleArgs(port)])
+        }
+      } catch (err) {
+        console.error(`Egress block rule failed for ${bin} port ${port}:`, err.message)
       }
-    } catch (err) {
-      console.error(`Egress block rule failed for port ${port}:`, err.message)
     }
   }
 }
 
 // For the admin panel's "verify it's actually active" check — reports which
-// of the expected ports currently have a matching DROP rule, so a failed
-// `sudo` (e.g. sudoers misconfigured after a box rebuild) is visible instead
-// of silently leaving the host unprotected.
+// of the expected ports currently have a matching DROP rule in BOTH stacks,
+// so a failed `sudo` or a missing v4/v6 rule is visible instead of silently
+// leaving the host unprotected.
 async function getEgressFirewallStatus () {
   const ports = await Promise.all(
-    ABUSE_PORTS.map(async port => ({ port, blocked: await ruleExists(port) }))
+    ABUSE_PORTS.map(async port => {
+      const v4 = await ruleExists('iptables-legacy', port)
+      const v6 = await ruleExists('ip6tables-legacy', port)
+      return { port, blocked: v4 && v6, v4, v6 }
+    })
   )
   return {
     runnerUser: RUNNER_USER,
