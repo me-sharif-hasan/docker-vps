@@ -22,7 +22,14 @@ jobs:
           echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/deploy_key iishanto@$SSH_HOST << 'EOF'
+          # Pin the host key for this run instead of disabling verification
+          # outright (StrictHostKeyChecking=no accepts ANY host silently,
+          # which is a MITM opening). ssh-keyscan still trusts whoever
+          # answers on first contact (TOFU), but it at least records and
+          # reuses one fixed key rather than ignoring the check every time.
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          ssh -o UserKnownHostsFile=~/.ssh/known_hosts -i ~/.ssh/deploy_key ubuntu@$SSH_HOST << 'EOF'
             set -e
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
