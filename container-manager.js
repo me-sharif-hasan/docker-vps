@@ -75,12 +75,22 @@ function firewallComment(uuid) {
   return `lab-${uuid}`
 }
 
+// Oracle (ORACLE_BASTION_IP) is the only path in: it DNATs public SSH
+// traffic on this same port range through the WireGuard tunnel to this
+// box's tunnel address. Scoping the allow to that source — instead of
+// "Anywhere" — means a direct connection to this host's own real public
+// IP on a lab port is refused by ufw's default-deny; the bastion is the
+// only route that actually reaches it.
+const ORACLE_BASTION_IP = '10.200.0.1'
+
 async function openFirewallPort(uuid, port) {
-  await execFileAsync('sudo', ['ufw', 'allow', `${port}/tcp`, 'comment', firewallComment(uuid)])
+  await execFileAsync('sudo', ['ufw', 'allow', 'from', ORACLE_BASTION_IP, 'to', 'any', 'port', String(port), 'proto', 'tcp', 'comment', firewallComment(uuid)])
 }
 
 async function closeFirewallPort(port) {
-  await execFileAsync('sudo', ['ufw', '--force', 'delete', 'allow', `${port}/tcp`]).catch(() => {})
+  // Must match openFirewallPort's rule spec exactly — ufw's `delete` deletes
+  // by matching the full rule, not just the port.
+  await execFileAsync('sudo', ['ufw', '--force', 'delete', 'allow', 'from', ORACLE_BASTION_IP, 'to', 'any', 'port', String(port), 'proto', 'tcp']).catch(() => {})
 }
 
 // On startup, sessions are empty (in-memory, wiped by every restart/deploy)
