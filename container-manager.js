@@ -68,6 +68,9 @@ const FIREWALL_RECONCILE_INTERVAL_MS = 5 * 60 * 1000 // 5 minutes
 // inside a lab show its real 200MB limit instead of the host's full RAM.
 const LXCFS_PROC_DIR = '/var/lib/lxcfs/proc'
 const LXCFS_FILES = ['cpuinfo', 'meminfo', 'stat', 'diskstats', 'swaps', 'uptime', 'loadavg']
+// lscpu reads online-CPU count from sysfs, not /proc/cpuinfo — lxcfs mirrors
+// this path too, cgroup/cpuset-aware the same way.
+const LXCFS_CPU_ONLINE = '/var/lib/lxcfs/sys/devices/system/cpu/online'
 
 // lxcfs's virtual cpuinfo lists the right core COUNT for the cgroup's cpu
 // quota, but `nproc` reads sched_getaffinity, not /proc/cpuinfo — it still
@@ -217,9 +220,10 @@ async function buildImageIfNeeded() {
 
 async function createContainer(uuid, publicKey, sshPort) {
   const cpusetCpu = nextCpusetCpu()
-  const lxcfsMounts = LXCFS_FILES.flatMap(f => [
-    '--mount', `type=bind,source=${LXCFS_PROC_DIR}/${f},destination=/proc/${f},ro=true`
-  ])
+  const lxcfsMounts = [
+    ...LXCFS_FILES.flatMap(f => ['--mount', `type=bind,source=${LXCFS_PROC_DIR}/${f},destination=/proc/${f},ro=true`]),
+    '--mount', `type=bind,source=${LXCFS_CPU_ONLINE},destination=/sys/devices/system/cpu/online,ro=true`
+  ]
 
   const args = [
     'run', '-d',
