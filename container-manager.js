@@ -89,7 +89,18 @@ function nextProjectId() {
 async function assignDiskQuota(containerId, projectId) {
   const { stdout } = await podman(['inspect', containerId, '--format', '{{.GraphDriver.Data.UpperDir}}'])
   const upperDir = stdout.trim()
-  await execFileAsync('sudo', ['xfs_quota', '-x', '-c', `project -s -p ${upperDir} ${projectId}`, LAB_STORAGE_MOUNT])
+  // Overlay's copy-up does: create the file under the layer's sibling
+  // `work/` dir, then rename() it into `diff/` (the actual upperdir).
+  // XFS refuses rename() across directories that carry DIFFERENT project
+  // ids - live-verified this exact failure: tagging only `diff/` left
+  // `work/` at project 0, so every copy-up (any new file/dir a lab user
+  // creates under a path that still lives in a lower image layer, which
+  // at container start is everything) failed with EXDEV, breaking even
+  // plain `mkdir`/`apt-get`. Both siblings need the same project id.
+  const workDir = `${path.dirname(upperDir)}/work`
+  for (const dir of [upperDir, workDir]) {
+    await execFileAsync('sudo', ['xfs_quota', '-x', '-c', `project -s -p ${dir} ${projectId}`, LAB_STORAGE_MOUNT])
+  }
   await execFileAsync('sudo', ['xfs_quota', '-x', '-c', `limit -p bhard=${CONTAINER_DISK_LIMIT} ${projectId}`, LAB_STORAGE_MOUNT])
 }
 
