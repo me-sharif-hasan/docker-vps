@@ -319,6 +319,24 @@ app.get('/labs/stats', async () => {
 })
 
 // ─────────────────────────────────────────────
+// GET /api/labs/config
+// Public, unauthenticated - just the two duration numbers, nothing
+// sensitive. Not under /labs/* (that prefix requires a Bearer token) or
+// /api/admin/* (that requires ADMIN_KEY): the app needs this before a
+// session exists, to render "free tier" / "pro tier" copy without baking
+// the minute counts into translated strings.
+// ─────────────────────────────────────────────
+app.get('/api/labs/config', async () => {
+  return {
+    success: true,
+    data: {
+      freeSessionMinutes: settings.freeSessionMinutes,
+      proSessionMinutes: settings.proSessionMinutes
+    }
+  }
+})
+
+// ─────────────────────────────────────────────
 // GET /health
 // ─────────────────────────────────────────────
 app.get('/health', async () => {
