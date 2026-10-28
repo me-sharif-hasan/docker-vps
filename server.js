@@ -685,6 +685,8 @@ function getDashboardHtml (qs) {
   .pill.pro{background:#3730a3;color:#e0e7ff}
   .pill.free{background:#334155;color:#cbd5e1}
   .susp-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1a1d2e;font-size:0.82rem}
+  tr.net-spike td{background:#3a1212}
+  .net-spike-val{color:#fca5a5;font-weight:700}
   .duration-edit{display:flex;gap:8px;align-items:center}
   .duration-edit input{background:#0f1117;border:1px solid #2d3148;border-radius:6px;padding:6px 8px;color:#e2e8f0;font-family:monospace;font-size:0.85rem}
   .duration-edit button{background:#3730a3;color:#e0e7ff;border:1px solid #4338ca;border-radius:6px;padding:6px 12px;font-size:0.8rem;font-weight:600;cursor:pointer}
@@ -693,7 +695,7 @@ function getDashboardHtml (qs) {
 </head>
 <body>
 <h1>ServerKit Labs <span id="last-update">Loading...</span></h1>
-<div class="refresh">Auto-refreshes every 5 seconds</div>
+<div class="refresh">Auto-refreshes every 5 seconds · <span id="rolling-avg">28-day avg bandwidth: —</span></div>
 <div class="settings-box">
   <div class="section-title">Settings</div>
   <div class="setting-item">
@@ -767,6 +769,15 @@ function barClass(p){return p>80?'danger':p>60?'warn':''}
 function fmt(n,d=1){return n==null?'—':n.toFixed(d)}
 function fmtTime(s){if(s<=0)return'Expired';const m=Math.floor(s/60);const sec=s%60;return m+'m '+sec+'s'}
 function fmtDate(ts){return new Date(ts).toLocaleTimeString()}
+function fmtBytes(n){
+  if(n==null)return'—'
+  if(n<1024)return n+' B'
+  const units=['KB','MB','GB','TB']
+  let v=n,i=-1
+  do{v/=1024;i++}while(v>=1024&&i<units.length-1)
+  return v.toFixed(1)+' '+units[i]
+}
+function fmtRate(bps){return bps==null?'—':fmtBytes(bps)+'/s'}
 
 async function toggleSkipDebug(){
   try{
@@ -1003,6 +1014,7 @@ async function load(){
     if(!j.success)return
     const d=j.data
     document.getElementById('last-update').textContent='Updated '+new Date().toLocaleTimeString()
+    document.getElementById('rolling-avg').textContent='28-day avg bandwidth: '+(d.rollingAvgRateBytesPerSec!=null?fmtRate(d.rollingAvgRateBytesPerSec):'not enough history yet')
 
     const slotColor=d.availableSlots===0?'red':d.availableSlots<=3?'yellow':'green'
     document.getElementById('cards').innerHTML=\`
@@ -1040,7 +1052,11 @@ async function load(){
       const statusBadge=c.orphaned
         ?'<span class="badge orphaned">orphaned</span>'
         :'<span class="badge running">running</span>'
-      return \`<tr>
+      const netCellClass=c.isBandwidthSpiking?'net-spike-val':''
+      const netTitle=c.isBandwidthSpiking
+        ?\`title="Rate \${fmtRate(c.currentRateBytesPerSec)} exceeds \${d.rollingAvgRateBytesPerSec!=null?(c.currentRateBytesPerSec/d.rollingAvgRateBytesPerSec).toFixed(1):'?'}x the 28-day system average"\`
+        :''
+      return \`<tr class="\${c.isBandwidthSpiking?'net-spike':''}">
         <td title="\${c.uuid}">\${c.uuid.slice(0,8)}…</td>
         <td>\${c.containerId}</td>
         <td>\${c.sshPort??'—'}</td>
@@ -1053,6 +1069,7 @@ async function load(){
           \${fmt(c.cpuPercent)} %
           <span class="bar-wrap"><span class="bar \${barClass(cpuP)}" style="width:\${cpuP}%"></span></span>
         </td>
+        <td \${netTitle} class="\${netCellClass}">↓\${fmtBytes(c.netInBytes)} / ↑\${fmtBytes(c.netOutBytes)}\${c.isBandwidthSpiking?' ⚠':''}</td>
         <td>\${remaining}</td>
         <td>\${fmtDate(c.createdAt)}</td>
         <td><button class="btn-destroy" onclick="destroy('\${c.fullContainerId}',this)">Destroy</button></td>
@@ -1063,7 +1080,7 @@ async function load(){
       <table>
         <thead><tr>
           <th>UUID</th><th>Container ID</th><th>SSH Port</th><th>Status</th>
-          <th>RAM</th><th>CPU</th><th>Expires</th><th>Started</th><th></th>
+          <th>RAM</th><th>CPU</th><th>Net In/Out</th><th>Expires</th><th>Started</th><th></th>
         </tr></thead>
         <tbody>\${rows}</tbody>
       </table>

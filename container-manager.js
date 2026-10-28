@@ -9,6 +9,11 @@ const os = require('os')
 const { settings } = require('./settings')
 const { logProvision } = require('./activity')
 const { ensureEgressBlockRules } = require('./firewall-egress')
+const { logSessionBandwidth, getRollingAvgRateBytesPerSec } = require('./bandwidth-history')
+
+// A container's current average rate above this multiple of the system's
+// 28-day rolling baseline gets flagged red in the dashboard.
+const BANDWIDTH_SPIKE_MULTIPLIER = 3
 
 // Podman (not Docker) runs the lab containers. Reason: labs run full systemd
 // as PID 1 (so labuser gets a real serviceable VPS, not just a bare shell),
@@ -332,6 +337,16 @@ async function destroyContainer(uuid, isAutoExpiry = false) {
     clearTimeout(session.timer)
   }
 
+  // Capture final bandwidth before teardown — this is the only chance to
+  // read it; the container is gone right after. Best-effort: a container
+  // that already died on its own (crash, OOM) won't answer `stats`, and
+  // that's fine, it just means this session doesn't contribute to the
+  // rolling average rather than blocking its own cleanup.
+  try {
+    const { bytesIn, bytesOut } = await getNetIoBytes(session.containerId)
+    logSessionBandwidth({ uuid, bytesIn, bytesOut, durationSeconds: (Date.now() - session.createdAt) / 1000 })
+  } catch { /* container unreachable - skip */ }
+
   // Drop all bookkeeping FIRST, synchronously, before the slow teardown
   // below (podman rm, firewall close — real wall-clock time). Otherwise a
   // provision() racing in on the same deviceId reads sessions/deviceSessions
@@ -383,6 +398,7 @@ async function getDetailedStats() {
   ])
   const running = JSON.parse(stdout || '[]')
   const containers = []
+  const rollingAvgRateBytesPerSec = getRollingAvgRateBytesPerSec()
 
   for (const info of running) {
     const containerName = (info.Names && info.Names[0]) || ''
@@ -409,6 +425,17 @@ async function getDetailedStats() {
         ? session.sshPort
         : (portEntry ? portEntry.host_port : null)
 
+      const [netInStr, netOutStr] = String(stats.net_io || '0B / 0B').split('/')
+      const netInBytes = parseBytesStr(netInStr)
+      const netOutBytes = parseBytesStr(netOutStr)
+      const netTotalBytes = netInBytes + netOutBytes
+      const elapsedSeconds = Math.max(1, (Date.now() - createdAt) / 1000)
+      const currentRateBytesPerSec = netTotalBytes / elapsedSeconds
+      // No baseline yet (first sessions ever) → nothing to compare against,
+      // so don't flag anything rather than treat zero as "infinitely over".
+      const isBandwidthSpiking = rollingAvgRateBytesPerSec != null &&
+        currentRateBytesPerSec > rollingAvgRateBytesPerSec * BANDWIDTH_SPIKE_MULTIPLIER
+
       containers.push({
         uuid,
         containerId: info.Id.slice(0, 12),
@@ -422,7 +449,12 @@ async function getDetailedStats() {
         cpuPercent: parseFloat(cpuPercent.toFixed(2)),
         memUsageMB: parseFloat(memUsageMB.toFixed(1)),
         memLimitMB: parseFloat(memLimitMB.toFixed(1)),
-        memPercent: parseFloat(((memUsageMB / memLimitMB) * 100).toFixed(1))
+        memPercent: parseFloat(((memUsageMB / memLimitMB) * 100).toFixed(1)),
+        netInBytes,
+        netOutBytes,
+        netTotalBytes,
+        currentRateBytesPerSec: Math.round(currentRateBytesPerSec),
+        isBandwidthSpiking
       })
     } catch {
       containers.push({
@@ -438,7 +470,12 @@ async function getDetailedStats() {
         cpuPercent: null,
         memUsageMB: null,
         memLimitMB: null,
-        memPercent: null
+        memPercent: null,
+        netInBytes: null,
+        netOutBytes: null,
+        netTotalBytes: null,
+        currentRateBytesPerSec: null,
+        isBandwidthSpiking: false
       })
     }
   }
@@ -453,8 +490,29 @@ async function getDetailedStats() {
     availableSlots: Math.max(0, MAX_CONCURRENT - activeCount),
     totalMemUsageMB: parseFloat(totalMemMB.toFixed(1)),
     totalCpuPercent: parseFloat(totalCpu.toFixed(2)),
+    rollingAvgRateBytesPerSec: rollingAvgRateBytesPerSec != null ? Math.round(rollingAvgRateBytesPerSec) : null,
     containers
   }
+}
+
+// Parses one side of podman stats' "X / Y" strings (net_io, block_io) into
+// raw bytes — same units podman prints for mem_usage, just not scaled to MB
+// like parseMemToMB below since callers here want byte-level precision for
+// small/idle containers.
+function parseBytesStr(str) {
+  const m = String(str).trim().match(/^([\d.]+)\s*([KMGT]?i?B)?$/i)
+  if (!m) return 0
+  const value = parseFloat(m[1])
+  const unit = (m[2] || 'B').toUpperCase()
+  const factors = { B: 1, KB: 1024, KIB: 1024, MB, MIB: MB, GB: MB * 1024, GIB: MB * 1024, TB: MB * 1024 * 1024, TIB: MB * 1024 * 1024 }
+  return value * (factors[unit] || 1)
+}
+
+async function getNetIoBytes(containerId) {
+  const { stdout } = await podman(['stats', '--no-stream', '--format', 'json', containerId])
+  const stats = JSON.parse(stdout)[0]
+  const [inStr, outStr] = String(stats.net_io || '0B / 0B').split('/')
+  return { bytesIn: parseBytesStr(inStr), bytesOut: parseBytesStr(outStr) }
 }
 
 function parseMemToMB(str) {
@@ -479,6 +537,17 @@ async function forceDestroyContainer(containerId) {
       const { stdout: portOut } = await podman(['inspect', containerId, '--format', '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}'])
       sshPort = parseInt(portOut.trim(), 10) || null
     } catch { /* container may already be gone */ }
+  }
+
+  // Only log bandwidth when we have a real session (accurate createdAt for
+  // duration). An orphaned container (service restarted, session map wiped
+  // - see reconcileFirewallRules' comment on why this happens) has no
+  // reliable start time here, so skip rather than log a bogus rate.
+  if (session) {
+    try {
+      const { bytesIn, bytesOut } = await getNetIoBytes(containerId)
+      logSessionBandwidth({ uuid, bytesIn, bytesOut, durationSeconds: (Date.now() - session.createdAt) / 1000 })
+    } catch { /* container unreachable - skip */ }
   }
 
   // Clean up bookkeeping before the slow teardown below — see
