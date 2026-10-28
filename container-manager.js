@@ -397,10 +397,40 @@ async function provisionContainer(uuid, deviceId, ip) {
   }
 }
 
+// A session can outlive the in-memory sessions Map (any app restart/deploy
+// wipes it, but podman containers keep running) - without this, the normal
+// DELETE /labs/:uuid path threw "Session not found" for such a container
+// forever, so "End Session" silently did nothing and the lab kept running
+// and ticking its original countdown. Find and tear it down by name instead.
+async function destroyOrphanedByUuid(uuid) {
+  const containerName = `lab-${uuid}`
+  let containerId
+  try {
+    const { stdout } = await podman(['inspect', containerName, '--format', '{{.Id}}'])
+    containerId = stdout.trim()
+  } catch {
+    throw new Error('Session not found')
+  }
+
+  let sshPort = null
+  try {
+    const { stdout: portOut } = await podman(['inspect', containerName, '--format', '{{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}'])
+    sshPort = parseInt(portOut.trim(), 10) || null
+  } catch { /* port lookup best-effort */ }
+
+  await podman(['rm', '-f', containerId])
+  if (sshPort) {
+    usedPorts.delete(sshPort)
+    await closeFirewallPort(sshPort)
+  }
+
+  return { uuid, destroyed: true, reason: 'orphaned' }
+}
+
 async function destroyContainer(uuid, isAutoExpiry = false) {
   const session = sessions.get(uuid)
   if (!session) {
-    throw new Error('Session not found')
+    return destroyOrphanedByUuid(uuid)
   }
 
   // Clear auto-termination timer if manually destroyed
