@@ -6,6 +6,7 @@ const execFileAsync = promisify(execFile)
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
+const { settings } = require('./settings')
 
 // Podman (not Docker) runs the lab containers. Reason: labs run full systemd
 // as PID 1 (so labuser gets a real serviceable VPS, not just a bare shell),
@@ -20,7 +21,6 @@ const os = require('os')
 // cannot mknod/mount any real device, all without Privileged or extra caps.
 const IMAGE_NAME = 'serverkit-lab'
 const MAX_CONCURRENT = 10
-const SESSION_DURATION_MS = 30 * 60 * 1000 // 30 minutes
 
 // Podman runs as this dedicated Linux user, not the app's own (iishanto/
 // ubuntu, whichever is deploying). Two independent reasons:
@@ -276,7 +276,12 @@ async function provisionContainer(uuid, deviceId) {
     throw err
   }
 
-  const expiresAt = Date.now() + SESSION_DURATION_MS
+  // Pro status is a stand-in for the real purchase/credits flow (not wired
+  // up yet) — admin marks a deviceId pro by hand via /api/admin/pro-devices.
+  const isPro = !!(deviceId && settings.proDeviceIds.includes(deviceId))
+  const durationMs = (isPro ? settings.proSessionMinutes : settings.freeSessionMinutes) * 60 * 1000
+
+  const expiresAt = Date.now() + durationMs
   const session = {
     uuid,
     containerId,
@@ -292,8 +297,7 @@ async function provisionContainer(uuid, deviceId) {
   sessions.set(uuid, session)
   if (deviceId) deviceSessions.set(deviceId, uuid)
 
-  // Auto-terminate after 30 mins
-  const timer = setTimeout(() => destroyContainer(uuid, true), SESSION_DURATION_MS)
+  const timer = setTimeout(() => destroyContainer(uuid, true), durationMs)
   session.timer = timer
 
   return {
@@ -302,7 +306,7 @@ async function provisionContainer(uuid, deviceId) {
     privateKey,
     user: 'labuser',
     expiresAt,
-    timeRemainingSeconds: 1800
+    timeRemainingSeconds: Math.floor(durationMs / 1000)
   }
 }
 
@@ -386,7 +390,7 @@ async function getDetailedStats() {
       const memLimitMB = CONTAINER_MEMORY_LIMIT / MB
 
       const createdAt = info.Created * 1000
-      const expiresAt = session ? session.expiresAt : createdAt + SESSION_DURATION_MS
+      const expiresAt = session ? session.expiresAt : createdAt + settings.freeSessionMinutes * 60 * 1000
       const timeRemainingSeconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))
 
       const portEntry = (info.Ports || []).find(p => p.container_port === 22 || p.container_port === '22')

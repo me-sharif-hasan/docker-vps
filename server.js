@@ -2,8 +2,6 @@
 
 const Fastify = require('fastify')
 const cors = require('@fastify/cors')
-const fs = require('fs')
-const path = require('path')
 const {
   provisionContainer,
   destroyContainer,
@@ -21,27 +19,9 @@ function isValidIp (str) {
   return typeof str === 'string' && net.isIP(str) !== 0
 }
 
-// Settings — persisted to settings.json, survives restarts
-const SETTINGS_FILE = path.join(__dirname, 'settings.json')
-
-function loadSettings () {
-  try {
-    const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    if (!Array.isArray(loaded.debugWhitelistIps)) loaded.debugWhitelistIps = []
-    return loaded
-  } catch {
-    return {
-      skipDebugPackages: process.env.SKIP_DEBUG_PACKAGES === 'true' || false,
-      debugWhitelistIps: []
-    }
-  }
-}
-
-function saveSettings () {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
-}
-
-const settings = loadSettings()
+// Settings — persisted to settings.json, survives restarts. Shared module
+// so container-manager.js reads the same live object (session durations).
+const { settings, saveSettings } = require('./settings')
 
 const app = Fastify({
   // Trust X-Forwarded-For / X-Real-IP only when the connecting socket is
@@ -235,7 +215,7 @@ app.post('/labs/provision', {
         ...result,
         host,
         connectCommand: `ssh -i <key-file> -p ${result.sshPort} labuser@${host}`,
-        message: `Session will auto-terminate in 30 minutes`
+        message: `Session will auto-terminate in ${Math.round(result.timeRemainingSeconds / 60)} minutes`
       }
     }
   } catch (err) {
@@ -426,6 +406,95 @@ app.post('/api/admin/debug-whitelist', async (request, reply) => {
   return reply.code(400).send({
     success: false,
     error: 'Invalid request. Expected: { add: ip } or { remove: ip }'
+  })
+})
+
+// ─────────────────────────────────────────────
+// GET  /api/admin/session-limits        — { freeSessionMinutes, proSessionMinutes }
+// POST /api/admin/session-limits        — { freeSessionMinutes?, proSessionMinutes? }
+// Duration applied by provisionContainer at provision time; a change here
+// does not affect sessions already running, only ones created afterward.
+// ─────────────────────────────────────────────
+app.get('/api/admin/session-limits', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return {
+    success: true,
+    data: {
+      freeSessionMinutes: settings.freeSessionMinutes,
+      proSessionMinutes: settings.proSessionMinutes
+    }
+  }
+})
+
+app.post('/api/admin/session-limits', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const { freeSessionMinutes, proSessionMinutes } = request.body || {}
+
+  if (freeSessionMinutes === undefined && proSessionMinutes === undefined) {
+    return reply.code(400).send({
+      success: false,
+      error: 'Invalid request. Expected: { freeSessionMinutes?: number, proSessionMinutes?: number }'
+    })
+  }
+
+  if (freeSessionMinutes !== undefined) {
+    if (typeof freeSessionMinutes !== 'number' || freeSessionMinutes <= 0) {
+      return reply.code(400).send({ success: false, error: 'freeSessionMinutes must be a positive number' })
+    }
+    settings.freeSessionMinutes = freeSessionMinutes
+  }
+
+  if (proSessionMinutes !== undefined) {
+    if (typeof proSessionMinutes !== 'number' || proSessionMinutes <= 0) {
+      return reply.code(400).send({ success: false, error: 'proSessionMinutes must be a positive number' })
+    }
+    settings.proSessionMinutes = proSessionMinutes
+  }
+
+  saveSettings()
+  return {
+    success: true,
+    data: {
+      freeSessionMinutes: settings.freeSessionMinutes,
+      proSessionMinutes: settings.proSessionMinutes
+    }
+  }
+})
+
+// ─────────────────────────────────────────────
+// GET  /api/admin/pro-devices        — list deviceIds granted the pro duration
+// POST /api/admin/pro-devices        — { add: deviceId } or { remove: deviceId }
+// Stand-in for the real purchase/credits flow (not wired up yet): admin
+// marks a deviceId pro by hand, provisionContainer looks it up at
+// provision time to pick freeSessionMinutes vs proSessionMinutes.
+// ─────────────────────────────────────────────
+app.get('/api/admin/pro-devices', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  return { success: true, data: { deviceIds: settings.proDeviceIds } }
+})
+
+app.post('/api/admin/pro-devices', async (request, reply) => {
+  if (checkAdminKey(request, reply) === false) return
+  const { add, remove } = request.body || {}
+
+  if (add !== undefined) {
+    if (typeof add !== 'string' || !add || add.length > 128) {
+      return reply.code(400).send({ success: false, error: 'Invalid deviceId' })
+    }
+    if (!settings.proDeviceIds.includes(add)) settings.proDeviceIds.push(add)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.proDeviceIds } }
+  }
+
+  if (remove !== undefined) {
+    settings.proDeviceIds = settings.proDeviceIds.filter(id => id !== remove)
+    saveSettings()
+    return { success: true, data: { deviceIds: settings.proDeviceIds } }
+  }
+
+  return reply.code(400).send({
+    success: false,
+    error: 'Invalid request. Expected: { add: deviceId } or { remove: deviceId }'
   })
 })
 
