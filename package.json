@@ -5,11 +5,15 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1164.0",
+    "@aws-sdk/lib-storage": "^3.1164.0",
     "@fastify/cors": "^10.1.0",
     "@fastify/rate-limit": "^10.2.2",
+    "@fastify/static": "^10.1.10",
     "fastify": "^5.0.0",
     "geoip-lite": "^1.4.10",
     "google-auth-library": "^10.6.2",

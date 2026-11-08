@@ -44,12 +44,28 @@ jobs:
               git remote add origin https://github.com/me-sharif-hasan/docker-vps.git
             fi
 
+            # Remember exactly what was live before this deploy touches
+            # anything - printed so a human can grab it from the Action's
+            # log for a manual rollback (git checkout -f <sha> && pm2
+            # restart serverkit-labs) without having to dig through git
+            # reflog on the server itself.
+            PREVIOUS_SHA=$(git rev-parse HEAD 2>/dev/null || echo "none (first deploy)")
+            echo "Previously deployed commit: $PREVIOUS_SHA"
+
             # Fetch latest code
             git fetch origin main
             git checkout -f origin/main
 
             # Install/update dependencies
             npm install --production
+
+            # Admin panel is a separate Vite app served by @fastify/static
+            # from admin-panel/dist - server.js fails to even start if that
+            # directory doesn't exist, so this is not optional.
+            cd admin-panel
+            npm install
+            npm run build
+            cd ..
 
             # Load environment config for the app
             set -a
@@ -59,11 +75,36 @@ jobs:
             # Restart the service
             if pm2 list | grep -q "serverkit-labs"; then
               pm2 restart serverkit-labs --update-env
-              echo "Service restarted successfully"
             else
               pm2 start server.js --name serverkit-labs
-              echo "Service started successfully"
             fi
 
-            echo "Deployment completed!"
+            # Verify it actually came back up healthy before declaring
+            # success - a crash-on-boot (e.g. a startup-time throw) would
+            # otherwise leave pm2 stuck restart-looping while this workflow
+            # still reports green. /health is public, no auth, no podman
+            # state - just confirms the HTTP server itself is alive.
+            PORT_TO_CHECK=$(grep '^PORT=' .env 2>/dev/null | cut -d= -f2)
+            PORT_TO_CHECK=${PORT_TO_CHECK:-3000}
+            HEALTHY=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              sleep 2
+              if curl -fsS "http://127.0.0.1:${PORT_TO_CHECK}/health" > /dev/null 2>&1; then
+                HEALTHY=1
+                break
+              fi
+            done
+
+            if [ "$HEALTHY" != "1" ]; then
+              echo "DEPLOY FAILED: server did not come back up healthy after restart."
+              echo "Rolling back to previous commit: $PREVIOUS_SHA"
+              if [ "$PREVIOUS_SHA" != "none (first deploy)" ]; then
+                git checkout -f "$PREVIOUS_SHA"
+                npm install --production
+                pm2 restart serverkit-labs --update-env
+              fi
+              exit 1
+            fi
+
+            echo "Deployment completed and verified healthy!"
           EOF

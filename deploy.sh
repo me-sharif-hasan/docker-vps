@@ -38,6 +38,13 @@ echo "Installing dependencies..."
 npm install --production
 
 echo ""
+echo "=== Building admin panel ==="
+cd admin-panel
+npm install
+npm run build
+cd ..
+
+echo ""
 echo "=== Service Status ==="
 # Check if pm2 is available
 if command -v pm2 &> /dev/null; then

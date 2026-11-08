@@ -7,3 +7,8 @@ serviceaccount-new.json
 settings.json
 activity.log
 bandwidth-history.log
+persisted-labs.json
+snapshot-log.json
+verified-entitlements.json
+lifetime-bandwidth.json
+admin-panel/dist/

@@ -108,4 +108,4 @@ function verifyLabsJwt (token) {
   return jwt.verify(token, JWT_SECRET)
 }
 
-module.exports = { verifyIntegrityToken, signLabsJwt, verifyLabsJwt }
+module.exports = { verifyIntegrityToken, signLabsJwt, verifyLabsJwt, SERVICE_ACCOUNT_PATH }
